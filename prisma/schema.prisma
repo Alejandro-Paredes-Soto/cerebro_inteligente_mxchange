@@ -1,0 +1,394 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model availability_subscriptions {
+  id               Int                                       @id @default(autoincrement())
+  user_id          Int
+  branch_id        Int
+  currency         availability_subscriptions_currency
+  operation_type   availability_subscriptions_operation_type
+  amount_requested Decimal                                   @db.Decimal(15, 2)
+  status           availability_subscriptions_status         @default(active)
+  notified_at      DateTime?                                 @db.DateTime(0)
+  expires_at       DateTime                                  @db.DateTime(0)
+  created_at       DateTime?                                 @default(now()) @db.Timestamp(0)
+  updated_at       DateTime?                                 @default(now()) @db.Timestamp(0)
+
+  @@unique([user_id, branch_id, currency, operation_type, status], map: "idx_avail_sub_unique_active")
+  @@index([status, branch_id, currency], map: "idx_avail_sub_active")
+  @@index([branch_id, currency, status], map: "idx_avail_sub_branch_currency")
+  @@index([status, expires_at], map: "idx_avail_sub_status_expires")
+  @@index([user_id], map: "idx_avail_sub_user")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model branches {
+  id               Int     @id @default(autoincrement())
+  name             String  @db.VarChar(255)
+  address          String  @db.VarChar(255)
+  city             String? @default("Nogales") @db.VarChar(100)
+  state            String? @default("Sonora") @db.VarChar(100)
+  is_matriz        Boolean @default(false)
+  google_maps_link String? @db.VarChar(2048)
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model cash_inventories {
+  id                 Int                       @id @default(autoincrement())
+  branch_id          Int
+  currency           cash_inventories_currency
+  count_date         DateTime                  @db.Date
+  count_time         DateTime?                 @db.Time(0)
+  cut_type           cash_inventories_cut_type @default(inicio_turno1)
+  shift_number       Int?                      @default(1) @db.TinyInt
+  total_amount       Decimal                   @default(0.00) @db.Decimal(15, 2)
+  expected_amount    Decimal?                  @db.Decimal(15, 2)
+  difference         Decimal?                  @default(0.00) @db.Decimal(15, 2)
+  notes              String?                   @db.Text
+  counted_by_user_id Int
+  created_at         DateTime?                 @default(now()) @db.Timestamp(0)
+  updated_at         DateTime?                 @default(now()) @db.Timestamp(0)
+
+  @@unique([branch_id, count_date, currency, cut_type, count_time], map: "idx_unique_branch_date_currency_cut_time")
+  @@index([branch_id, count_date], map: "idx_cash_inv_branch_date")
+  @@index([currency], map: "idx_cash_inv_currency")
+  @@index([counted_by_user_id], map: "idx_cash_inv_user")
+}
+
+model cash_inventory_items {
+  id                Int                            @id @default(autoincrement())
+  cash_inventory_id Int
+  denomination      Decimal                        @db.Decimal(10, 2)
+  quantity          Int                            @default(0)
+  subtotal          Decimal                        @db.Decimal(15, 2)
+  item_type         cash_inventory_items_item_type
+  created_at        DateTime?                      @default(now()) @db.Timestamp(0)
+  updated_at        DateTime?                      @default(now()) @db.Timestamp(0)
+
+  @@unique([cash_inventory_id, denomination, item_type], map: "idx_unique_inventory_denomination_type")
+  @@index([cash_inventory_id], map: "idx_cash_item_inventory")
+}
+
+model exchange_rate_history {
+  id         Int       @id @default(autoincrement())
+  rate_buy   Decimal   @db.Decimal(10, 4)
+  rate_sell  Decimal   @db.Decimal(10, 4)
+  fetched_at DateTime? @default(now()) @db.Timestamp(0)
+}
+
+model inventory {
+  id                  Int                @id @default(autoincrement())
+  branch_id           Int
+  currency            inventory_currency
+  amount              Decimal            @db.Decimal(15, 2)
+  low_stock_threshold Decimal?           @default(1000.00) @db.Decimal(15, 2)
+  last_updated        DateTime?          @default(now()) @db.Timestamp(0)
+
+  @@index([branch_id, currency], map: "idx_inventory_branch_currency")
+}
+
+model inventory_adjustments {
+  id              Int                                   @id @default(autoincrement())
+  inventory_id    Int
+  old_amount      Decimal?                              @db.Decimal(15, 2)
+  new_amount      Decimal?                              @db.Decimal(15, 2)
+  adjustment_type inventory_adjustments_adjustment_type
+  reason          String?                               @db.Text
+  adjusted_by     Int?
+  adjusted_at     DateTime?                             @default(now()) @db.Timestamp(0)
+
+  @@index([adjusted_by], map: "adjusted_by")
+  @@index([inventory_id], map: "inventory_id")
+}
+
+model inventory_reservations {
+  id              Int                             @id @default(autoincrement())
+  transaction_id  Int
+  branch_id       Int
+  currency        inventory_reservations_currency
+  amount_reserved Decimal                         @db.Decimal(15, 2)
+  status          inventory_reservations_status   @default(reserved)
+  expires_at      DateTime?                       @db.DateTime(0)
+  created_at      DateTime?                       @default(now()) @db.Timestamp(0)
+  committed_at    DateTime?                       @db.Timestamp(0)
+  released_at     DateTime?                       @db.Timestamp(0)
+
+  @@unique([transaction_id, currency], map: "uq_reservation_tx_currency")
+  @@index([branch_id, currency, status, amount_reserved], map: "idx_reservation_branch_currency_status")
+  @@index([status, expires_at], map: "idx_reservation_expires_status")
+  @@index([transaction_id], map: "idx_reservation_tx")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model inventory_transfers {
+  id             Int                          @id @default(autoincrement())
+  from_branch_id Int
+  to_branch_id   Int
+  currency       inventory_transfers_currency
+  amount         Decimal                      @db.Decimal(15, 2)
+  status         inventory_transfers_status   @default(pending)
+  notes          String?                      @db.Text
+  requested_by   Int?
+  approved_by    Int?
+  completed_by   Int?
+  requested_at   DateTime?                    @default(now()) @db.Timestamp(0)
+  approved_at    DateTime?                    @db.Timestamp(0)
+  completed_at   DateTime?                    @db.Timestamp(0)
+  created_at     DateTime?                    @default(now()) @db.Timestamp(0)
+  updated_at     DateTime?                    @default(now()) @db.Timestamp(0)
+
+  @@index([approved_by], map: "fk_transfer_approved_by")
+  @@index([completed_by], map: "fk_transfer_completed_by")
+  @@index([requested_by], map: "fk_transfer_requested_by")
+  @@index([currency], map: "idx_transfer_currency")
+  @@index([requested_at, completed_at], map: "idx_transfer_dates")
+  @@index([from_branch_id], map: "idx_transfer_from")
+  @@index([status], map: "idx_transfer_status")
+  @@index([to_branch_id], map: "idx_transfer_to")
+}
+
+model notifications {
+  id                Int                          @id @default(autoincrement())
+  recipient_role    notifications_recipient_role
+  recipient_user_id Int?
+  branch_id         Int?
+  title             String                       @db.VarChar(200)
+  message           String                       @db.Text
+  event_type        String                       @db.VarChar(100)
+  transaction_id    Int?
+  read_at           DateTime?                    @db.DateTime(0)
+  created_at        DateTime?                    @default(now()) @db.Timestamp(0)
+
+  @@index([branch_id], map: "idx_notifications_branch")
+  @@index([created_at(sort: Desc)], map: "idx_notifications_created")
+  @@index([recipient_role, branch_id], map: "idx_notifications_role_branch")
+  @@index([recipient_user_id], map: "recipient_user_id")
+  @@index([transaction_id], map: "transaction_id")
+}
+
+model payment_methods {
+  id          Int       @id @default(autoincrement())
+  payment_id  Int
+  type        String?   @db.VarChar(100)
+  last4       String?   @db.VarChar(10)
+  brand       String?   @db.VarChar(50)
+  holder_name String?   @db.VarChar(255)
+  created_at  DateTime? @default(now()) @db.Timestamp(0)
+
+  @@index([payment_id], map: "payment_id")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model payments {
+  id                       Int       @id @default(autoincrement())
+  transaction_id           Int?
+  stripe_payment_intent_id String?   @db.VarChar(255)
+  stripe_customer_id       String?   @db.VarChar(255)
+  payment_method_type      String?   @default("card") @db.VarChar(50)
+  oxxo_number              String?   @db.VarChar(50)
+  oxxo_expires_at          DateTime? @db.DateTime(0)
+  oxxo_hosted_voucher_url  String?   @db.VarChar(1024)
+  amount                   Decimal   @db.Decimal(15, 2)
+  currency                 String    @db.VarChar(10)
+  status                   String?   @default("pending") @db.VarChar(50)
+  raw_response             Json?
+  updated_at               DateTime? @default(now()) @db.Timestamp(0)
+  created_at               DateTime? @default(now()) @db.Timestamp(0)
+
+  @@index([payment_method_type, status, oxxo_expires_at], map: "idx_oxxo_pending")
+  @@index([payment_method_type], map: "idx_payment_method_type")
+  @@index([stripe_customer_id], map: "idx_stripe_customer")
+  @@index([stripe_payment_intent_id], map: "idx_stripe_payment_intent")
+  @@index([transaction_id], map: "transaction_id")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model satisfaction_surveys {
+  id             Int       @id @default(autoincrement())
+  transaction_id Int       @unique(map: "unique_survey_per_transaction")
+  user_id        Int
+  rating         Int       @db.TinyInt
+  comment        String?   @db.Text
+  created_at     DateTime? @default(now()) @db.Timestamp(0)
+
+  @@index([created_at(sort: Desc)], map: "idx_survey_created")
+  @@index([created_at, rating], map: "idx_survey_date_rating")
+  @@index([rating], map: "idx_survey_rating")
+  @@index([user_id], map: "idx_survey_user")
+}
+
+model settings {
+  key_name String @id @db.VarChar(100)
+  value    String @db.Text
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model transactions {
+  id                 Int                        @id @default(autoincrement())
+  user_id            Int
+  branch_id          Int
+  type               transactions_type
+  amount_from        Decimal                    @db.Decimal(15, 2)
+  currency_from      transactions_currency_from
+  amount_to          Decimal                    @db.Decimal(15, 2)
+  currency_to        transactions_currency_to
+  exchange_rate      Decimal                    @db.Decimal(10, 4)
+  commission_percent Decimal?                   @default(0.00) @db.Decimal(5, 2)
+  commission_amount  Decimal?                   @default(0.00) @db.Decimal(15, 2)
+  status             transactions_status        @default(reserved)
+  transaction_code   String                     @unique(map: "transaction_code") @db.VarChar(20)
+  created_at         DateTime?                  @default(now()) @db.Timestamp(0)
+  updated_at         DateTime?                  @default(now()) @db.Timestamp(0)
+  method             String?                    @db.VarChar(255)
+  expires_at         DateTime?                  @db.DateTime(0)
+
+  @@index([branch_id], map: "branch_id")
+  @@index([expires_at, status], map: "idx_transactions_expires_at")
+  @@index([user_id], map: "user_id")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model users {
+  idUser        Int                  @id @default(autoincrement())
+  name          String               @db.VarChar(100)
+  email         String               @unique(map: "email_UNIQUE") @db.VarChar(100)
+  password      String?              @db.VarChar(255)
+  phone_code    String?              @db.VarChar(10)
+  phone_number  String?              @db.VarChar(15)
+  auth_provider users_auth_provider? @default(email)
+  role          users_role?          @default(client)
+  branch_id     Int?
+  createdAt     DateTime?            @default(now()) @db.DateTime(0)
+  active        Boolean?             @default(true)
+
+  @@index([branch_id], map: "idx_users_branch_id")
+}
+
+model visits {
+  idVisit   Int      @id @default(autoincrement())
+  visitorId String   @unique(map: "idDevice_UNIQUE") @db.VarChar(255)
+  platform  String?  @db.VarChar(255)
+  createdAt DateTime @default(now()) @db.DateTime(0)
+}
+
+enum notifications_recipient_role {
+  admin
+  user
+  sucursal
+}
+
+enum cash_inventories_currency {
+  USD
+  MXN
+}
+
+enum inventory_currency {
+  USD
+  MXN
+}
+
+enum availability_subscriptions_currency {
+  USD
+  MXN
+}
+
+enum inventory_reservations_currency {
+  USD
+  MXN
+}
+
+enum inventory_transfers_currency {
+  USD
+  MXN
+}
+
+enum transactions_type {
+  buy
+  sell
+}
+
+enum availability_subscriptions_operation_type {
+  buy
+  sell
+}
+
+enum inventory_adjustments_adjustment_type {
+  entry
+  exit
+}
+
+enum cash_inventories_cut_type {
+  inicio_turno1
+  cierre_turno1
+  inicio_turno2
+  cierre_turno2
+  dotacion_inyeccion
+  dotacion_retiro
+}
+
+enum cash_inventory_items_item_type {
+  bill
+  coin
+}
+
+enum inventory_reservations_status {
+  reserved
+  committed
+  released
+  expired
+}
+
+enum inventory_transfers_status {
+  pending
+  in_transit
+  completed
+  cancelled
+}
+
+enum transactions_currency_from {
+  USD
+  MXN
+}
+
+enum availability_subscriptions_status {
+  active
+  notified
+  expired
+  cancelled
+}
+
+enum users_auth_provider {
+  email
+  google
+}
+
+enum transactions_currency_to {
+  USD
+  MXN
+}
+
+enum users_role {
+  client
+  admin
+  sucursal
+}
+
+enum transactions_status {
+  reserved
+  pending_payment
+  processing
+  paid
+  ready_for_pickup
+  ready_to_receive
+  completed
+  cancelled
+  expired
+}
