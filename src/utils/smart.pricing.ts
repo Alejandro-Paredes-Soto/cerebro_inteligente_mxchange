@@ -1,5 +1,4 @@
 import { AlertService } from "./alert.service";
-import { GptExplainer } from "./gpt-explainer.service";
 import { MarketAnalyzer } from "./market-analyzer.service";
 import { PriceAdjuster } from "./price-adjuster.service";
 import {
@@ -12,22 +11,13 @@ export class SmartPricingEngine {
   private analyzer: MarketAnalyzer;
   private adjuster: PriceAdjuster;
   private alertService: AlertService;
-  private explainer: GptExplainer;
 
-  constructor(
-    private config: ExchangeConfig,
-    openAiApiKey: string
-  ) {
+  constructor(private config: ExchangeConfig) {
     this.analyzer = new MarketAnalyzer(config);
     this.adjuster = new PriceAdjuster(config);
     this.alertService = new AlertService(config);
-    this.explainer = new GptExplainer(openAiApiKey);
   }
 
-  /**
-   * Punto de entrada principal.
-   * Llama a esto cada vez que obtienes datos frescos de tus 3 APIs.
-   */
   async process(snapshot: MarketSnapshot): Promise<SmartPricingResult> {
     // 1. Analizar condición del mercado (pura lógica)
     const analysis = this.analyzer.analyze(snapshot);
@@ -38,20 +28,11 @@ export class SmartPricingEngine {
     // 3. Evaluar alertas
     const alerts = this.alertService.evaluate(analysis, adjustment, snapshot);
 
-    // 4. GPT genera la explicación del resultado
-    const { explanation, marginSuggestion } = await this.explainer.explain(
-      analysis,
-      adjustment,
-      alerts,
-      this.config
-    );
 
     return {
       analysis,
       adjustment,
       alerts,
-      explanation,
-      marginSuggestion,
       processedAt: new Date(),
     };
   }
