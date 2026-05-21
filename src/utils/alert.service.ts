@@ -51,34 +51,29 @@ export class AlertService {
       alerts.push({
         type: "high_volatility",
         severity: analysis.volatilityScore >= 0.8 ? "critical" : "warning",
-        message: `Volatilidad elevada detectada (score: ${(analysis.volatilityScore * 100).toFixed(1)}%). Margen ampliado a ${adjustment.margin.toFixed(2)}%.`,
+        message: `Volatilidad elevada detectada (score: ${(analysis.volatilityScore * 100).toFixed(1)}%). Spreads ampliados a ${adjustment.buySpread} (compra) y ${adjustment.sellSpread} (venta).`,
         triggeredAt: now,
         data: {
           volatilityScore: analysis.volatilityScore,
-          spreadDispersion: analysis.spreadDispersion,
-          appliedMargin: adjustment.margin,
+          appliedBuySpread: adjustment.buySpread,
+          appliedSellSpread: adjustment.sellSpread,
         },
       });
     }
 
-    // Alerta 3: Mercado se estabilizó (condición estable + venía de volatilidad)
-    if (
-      analysis.marketCondition === "stable" &&
-      adjustment.adjustmentReason === "stable_market"
-    ) {
+    // Alerta 3: Inventario Peligroso
+    if (Math.abs(analysis.inventoryPressure) > 0.3) {
+      const status = analysis.inventoryPressure > 0 ? "EXCESO" : "ESCASEZ";
       alerts.push({
-        type: "market_stabilized",
-        severity: "info",
-        message: `Mercado estable. Margen reducido a ${adjustment.margin.toFixed(2)}% para mayor competitividad.`,
+        type: "inventory_warning",
+        severity: "critical",
+        message: `¡${status} CRÍTICO DE INVENTARIO! La caja está desviada un ${(Math.abs(analysis.inventoryPressure)*100).toFixed(1)}% del target ideal.`,
         triggeredAt: now,
-        data: {
-          volatilityScore: analysis.volatilityScore,
-          appliedMargin: adjustment.margin,
-        },
+        data: { inventoryPressure: analysis.inventoryPressure }
       });
     }
 
-    // Alerta 4: Anomalía de spread entre APIs (una API muy desviada del resto)
+    // Alerta 4: Anomalía de spread entre APIs
     const sellRates = snapshot.externalRates.map((r) => r.sellRate);
     const anomaly = this.detectOutlier(sellRates);
     if (anomaly) {
@@ -88,6 +83,22 @@ export class AlertService {
         message: `Una fuente externa tiene un tipo de cambio muy distinto al resto (${anomaly.source}: ${anomaly.value.toFixed(4)} vs promedio ${anomaly.average.toFixed(4)}).`,
         triggeredAt: now,
         data: anomaly,
+      });
+    }
+
+    // Alerta 5: Protección de margen por costo FIFO
+    if (adjustment.fifoProtectionApplied && adjustment.minSafeSellRate != null) {
+      alerts.push({
+        type: "fifo_guardrail",
+        severity: "critical",
+        message: `La venta propuesta por mercado quedaba por debajo del costo FIFO protegido. Se elevó la venta a ${adjustment.minSafeSellRate.toFixed(4)} para conservar al menos ${(this.config.minSpreadCents * 100).toFixed(0)}¢ sobre el costo promedio del inventario.`,
+        triggeredAt: now,
+        data: {
+          fifoAverageCost: analysis.fifoAverageCost,
+          minSafeSellRate: adjustment.minSafeSellRate,
+          adjustedSellRate: adjustment.adjustedSellRate,
+          minimumSpreadCents: this.config.minSpreadCents,
+        },
       });
     }
 

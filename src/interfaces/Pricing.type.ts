@@ -1,12 +1,25 @@
 export interface ExternalRate {
-  source: string; // nombre de la API: "api1", "api2", "api3"
+  source: string; // nombre de la API: "api1", "api2", "api3" o "Monex", "Banxico"
   buyRate: number; // tipo de cambio compra
   sellRate: number; // tipo de cambio venta
   fetchedAt: Date;
 }
 
+export interface SystemMetrics {
+  buy_avg: number;
+  sell_avg: number;
+  fix_banxico: number | null;
+  fifo_avg_cost: number | null;
+  usd_inventory: number; // Cuántos dólares físicos hay en la caja
+  total_buy_operations: number; // Cuántas veces el cliente ha VENDIDO USD a la casa
+  total_sell_operations: number; // Cuántas veces el cliente ha COMPRADO USD a la casa
+  daily_spread?: number;
+  daily_profit_mxn?: number;
+}
+
 export interface MarketSnapshot {
   externalRates: ExternalRate[];
+  systemMetrics: SystemMetrics; // Métricas reales del negocio
   previousSnapshot?: MarketSnapshot;
   timestamp: Date;
 }
@@ -14,9 +27,16 @@ export interface MarketSnapshot {
 export interface MarketAnalysis {
   averageExternalBuy: number;
   averageExternalSell: number;
-  volatilityScore: number; // 0 a 1 (0 = estable, 1 = muy volátil)
-  buyPressure: number; // -1 a 1 (negativo = presión vendedora, positivo = compradora)
-  spreadDispersion: number; // qué tan dispersos están los valores entre APIs
+  referenceBaseRate: number;   // Ancla de precio: FIX Banxico (preferido) o promedio externo
+  referenceSource: 'fix_banxico' | 'external_avg'; // De dónde viene la referencia
+  fixDeviation: number;        // Cuánto se aleja el mercado regional del FIX (+ = regional más caro)
+  volatilityScore: number;     // 0 a 1 (0 = estable, 1 = muy volátil)
+
+  // Métricas locales de presión
+  inventoryPressure: number;   // > 0 exceso de USD, < 0 escasez de USD
+  sellDemandLevel: number;     // Nivel de demanda de venta (cuántos escalones subimos)
+  fifoAverageCost: number | null;
+
   isVolatile: boolean;
   marketCondition: "stable" | "moderate" | "volatile";
 }
@@ -26,17 +46,20 @@ export interface PriceAdjustment {
   baseSellRate: number;
   adjustedBuyRate: number;
   adjustedSellRate: number;
-  margin: number; // margen aplicado en porcentaje
+  buySpread: number; // Margen en centavos aplicado a la compra (ej. 0.20)
+  sellSpread: number; // Margen en centavos aplicado a la venta (ej. 0.21)
   buyDelta: number; // diferencia vs precio anterior
   sellDelta: number;
   adjustmentReason: AdjustmentReason;
+  fifoProtectionApplied: boolean;
+  minSafeSellRate: number | null;
 }
 
 export type AdjustmentReason =
-  | "high_buy_pressure" // mucha gente queriendo comprar
-  | "high_sell_pressure" // mucha gente queriendo vender
-  | "volatile_market" // mercado volátil, ampliar margen
-  | "stable_market" // mercado estable, reducir margen
+  | "high_local_demand" // El negocio está vendiendo muchos USD (subir centavos)
+  | "excess_inventory" // El negocio tiene muchos USD (bajar precio de venta para sacar)
+  | "volatile_market" // mercado volátil, proteger
+  | "stable_market" // mercado estable, mantener base
   | "no_change"; // sin cambios significativos
 
 export interface Alert {
@@ -51,14 +74,14 @@ export type AlertType =
   | "significant_rate_change"
   | "high_volatility"
   | "market_stabilized"
-  | "spread_anomaly";
+  | "spread_anomaly"
+  | "fifo_guardrail"
+  | "inventory_warning"; // Alerta si hay demasiados o muy pocos dólares
 
 export interface SmartPricingResult {
   analysis: MarketAnalysis;
   adjustment: PriceAdjustment;
   alerts: Alert[];
-  explanation: string; // generada por GPT
-  marginSuggestion: string; // sugerencia de estrategia por GPT
   processedAt: Date;
 }
 
@@ -68,10 +91,24 @@ export interface ExchangeConfig {
   currentSellRate: number;
   baseCurrency: string; // ej: "USD"
   quoteCurrency: string; // ej: "MXN"
-  minMarginPercent: number; // margen mínimo permitido
-  maxMarginPercent: number; // margen máximo permitido
-  defaultMarginPercent: number;
-  volatilityThreshold: number; // 0-1, a partir de qué score se considera volátil
-  pressureThreshold: number; // 0-1, a partir de qué score hay "mucha" presión
-  significantChangePercent: number; // % mínimo para disparar alerta
+
+  // REGLAS DE CENTAVOS
+  // Ejemplo visual del día de Miguel:
+  //   minSpreadCents     = 0.20  → Piso. NUNCA gana menos de 20¢. Línea roja.
+  //   startingSpreadCents = 0.25  → Precio de arranque de la mañana. Tiene 5¢ de colchón.
+  //   maxSpreadCents     = 0.30  → Techo. No subir más para no salirse del mercado.
+  //
+  //   Escenario exceso USD: venta baja de 25¢ → 24 → 23 → 22 → 21 → 20¢ (mínimo garantizado)
+  //   Escenario alta demanda: venta sube de 25¢ → 26 → 27 → ... → 30¢ (techo)
+  minSpreadCents: number;      // Piso mínimo de ganancia por operación (nunca cruzar)
+  startingSpreadCents: number; // Spread de arranque del día (el colchón sobre el mínimo)
+  maxSpreadCents: number;      // Techo máximo para no salirse de competencia
+
+  // REGLAS DE DEMANDA LOCAL
+  operationsThreshold: number; // Cada cuántas operaciones subimos 1 centavo (ej: 100)
+  centsStepUp: number;         // Cuánto subimos por escalón (ej: 0.01)
+  targetUsdInventory: number;  // Inventario sano deseado en USD (ej: 50,000)
+
+  volatilityThreshold: number;       // 0-1, a partir de qué score se considera volátil
+  significantChangePercent: number;  // % mínimo para disparar alerta
 }

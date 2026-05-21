@@ -3,139 +3,108 @@ import {
   ExchangeConfig,
   MarketAnalysis,
   PriceAdjustment,
-} from "./../interfaces/Pricing.type"
+} from "./../interfaces/Pricing.type";
+
 export class PriceAdjuster {
   constructor(private config: ExchangeConfig) {}
 
-  /**
-   * Aplica las 4 reglas del negocio de forma determinista.
-   * GPT no participa aquí — solo explica el resultado después.
-   */
   adjust(analysis: MarketAnalysis): PriceAdjustment {
-    const { reason, marginPercent } = this.selectStrategy(analysis);
+    const { reason, buySpread, sellSpread } = this.selectStrategy(analysis);
 
-    // El precio base lo tomamos del promedio externo (referencia de mercado)
-    const baseBuyRate = analysis.averageExternalBuy;
-    const baseSellRate = analysis.averageExternalSell;
+    // El precio base ancla (ej. el FIX o promedio de bancos locales)
+    const baseRate = analysis.referenceBaseRate;
 
-    // Aplicamos el margen: compramos más barato, vendemos más caro
-    const halfMargin = marginPercent / 2;
-    const adjustedBuyRate = baseBuyRate * (1 - halfMargin / 100);
-    const adjustedSellRate = baseSellRate * (1 + halfMargin / 100);
+    // Aplicamos el spread en centavos (Miguel garantiza sus centavos)
+    const adjustedBuyRate = baseRate - buySpread;
+    let adjustedSellRate = baseRate + sellSpread;
+    const minSafeSellRate = analysis.fifoAverageCost != null
+      ? analysis.fifoAverageCost + this.config.minSpreadCents
+      : null;
+    const fifoProtectionApplied = minSafeSellRate != null && adjustedSellRate < minSafeSellRate;
+
+    if (fifoProtectionApplied && minSafeSellRate != null) {
+      adjustedSellRate = minSafeSellRate;
+    }
 
     return {
-      baseBuyRate,
-      baseSellRate,
+      baseBuyRate: baseRate,
+      baseSellRate: baseRate,
       adjustedBuyRate,
       adjustedSellRate,
-      margin: marginPercent,
+      buySpread,
+      sellSpread: adjustedSellRate - baseRate,
       buyDelta: adjustedBuyRate - this.config.currentBuyRate,
       sellDelta: adjustedSellRate - this.config.currentSellRate,
       adjustmentReason: reason,
+      fifoProtectionApplied,
+      minSafeSellRate,
     };
   }
 
   private selectStrategy(analysis: MarketAnalysis): {
     reason: AdjustmentReason;
-    marginPercent: number;
+    buySpread: number;
+    sellSpread: number;
   } {
     const {
-      defaultMarginPercent,
-      minMarginPercent,
-      maxMarginPercent,
-      volatilityThreshold,
-      pressureThreshold,
+      minSpreadCents,
+      startingSpreadCents,
+      maxSpreadCents,
+      centsStepUp,
     } = this.config;
 
-    const { buyPressure, volatilityScore, isVolatile } = analysis;
-    const hasBuyPressure = buyPressure > pressureThreshold;
-    const hasSellPressure = buyPressure < -pressureThreshold;
+    // Punto de partida: spread de arranque del día (ej. 25¢)
+    // El piso nunca se cruza: minSpreadCents (ej. 20¢)
+    let buySpread  = startingSpreadCents;
+    let sellSpread = startingSpreadCents;
+    let reason: AdjustmentReason = "stable_market";
 
-    // Regla 1: Mucha gente queriendo COMPRAR → sube precio de venta
-    if (hasBuyPressure && !isVolatile) {
-      const boost = this.scale(buyPressure, pressureThreshold, 1, 0, 0.5);
-      return {
-        reason: "high_buy_pressure",
-        marginPercent: this.clamp(
-          defaultMarginPercent + boost,
-          minMarginPercent,
-          maxMarginPercent
-        ),
-      };
-    }
-
-    // Regla 2: Mucha gente queriendo VENDER → baja precio de compra
-    if (hasSellPressure && !isVolatile) {
-      const reduction = this.scale(
-        Math.abs(buyPressure),
-        pressureThreshold,
-        1,
-        0,
-        0.5
+    // ── Regla 1: Alta demanda de venta (le compran muchos USD a Miguel)
+    // El mercado quiere dólares → Miguel puede subir el precio de venta.
+    // Subimos sell spread por escalones desde el precio de arranque.
+    // La compra se mantiene en el precio de arranque (no cambia).
+    if (analysis.sellDemandLevel > 0 && !analysis.isVolatile) {
+      const extraCents = analysis.sellDemandLevel * centsStepUp;
+      sellSpread = this.clamp(
+        startingSpreadCents + extraCents,
+        minSpreadCents,
+        maxSpreadCents
       );
-      return {
-        reason: "high_sell_pressure",
-        marginPercent: this.clamp(
-          defaultMarginPercent - reduction,
-          minMarginPercent,
-          maxMarginPercent
-        ),
-      };
+      reason = "high_local_demand";
     }
 
-    // Regla 3: Mercado volátil → ampliar margen para proteger ganancia
-    if (isVolatile) {
-      const extra = this.scale(
-        volatilityScore,
-        volatilityThreshold,
-        1,
-        0,
-        0.8
+    // ── Regla 2: Exceso de inventario USD en caja
+    // Miguel tiene más USD de los que quiere → necesita vender.
+    // Bajamos el precio de venta (sell spread) desde el arranque hacia el mínimo,
+    // proporcionalmente al exceso. Esto hace la oferta más atractiva.
+    // También penalizamos la compra (buy spread sube) para desincentivar que le traigan más USD.
+    if (analysis.inventoryPressure > 0.2 && reason === "stable_market") {
+      // Cuánto bajamos la venta: proporcional al exceso, hasta llegar al mínimo
+      const reductionFactor = Math.min(analysis.inventoryPressure, 1.0); // 0..1
+      const reductionRange  = startingSpreadCents - minSpreadCents;      // ej: 25¢ - 20¢ = 5¢
+      sellSpread = this.clamp(
+        startingSpreadCents - (reductionRange * reductionFactor),
+        minSpreadCents,
+        startingSpreadCents
       );
-      return {
-        reason: "volatile_market",
-        marginPercent: this.clamp(
-          defaultMarginPercent + extra,
-          minMarginPercent,
-          maxMarginPercent
-        ),
-      };
-    }
-
-    // Regla 4: Mercado estable → reducir margen para ser más competitivo
-    if (analysis.marketCondition === "stable") {
-      const reduction = this.scale(
-        1 - volatilityScore,
-        0,
-        1 - volatilityThreshold,
-        0,
-        0.3
+      // Penalizamos la compra: mientras más exceso, menos pagamos por USD que nos traigan
+      buySpread = this.clamp(
+        startingSpreadCents + (centsStepUp * 3 * reductionFactor),
+        minSpreadCents,
+        maxSpreadCents
       );
-      return {
-        reason: "stable_market",
-        marginPercent: this.clamp(
-          defaultMarginPercent - reduction,
-          minMarginPercent,
-          maxMarginPercent
-        ),
-      };
+      reason = "excess_inventory";
     }
 
-    return { reason: "no_change", marginPercent: defaultMarginPercent };
-  }
+    // ── Regla 3: Mercado altamente volátil
+    // Abrimos ambos spreads al máximo para proteger la ganancia ante movimientos bruscos.
+    if (analysis.isVolatile) {
+      buySpread  = maxSpreadCents;
+      sellSpread = maxSpreadCents;
+      reason = "volatile_market";
+    }
 
-  /**
-   * Escala un valor de [inMin, inMax] a [outMin, outMax]
-   */
-  private scale(
-    value: number,
-    inMin: number,
-    inMax: number,
-    outMin: number,
-    outMax: number
-  ): number {
-    const ratio = Math.min(1, Math.max(0, (value - inMin) / (inMax - inMin)));
-    return outMin + ratio * (outMax - outMin);
+    return { reason, buySpread, sellSpread };
   }
 
   private clamp(value: number, min: number, max: number): number {
