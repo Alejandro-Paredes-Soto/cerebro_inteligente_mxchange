@@ -1,0 +1,10 @@
+services:
+  crawl4ai:
+    image: unclecode/crawl4ai:0.8.5
+    container_name: mxchange-crawl4ai
+    ports:
+      - "127.0.0.1:11235:11235"
+    env_file:
+      - .llm.env
+    shm_size: 1gb
+    restart: unless-stopped

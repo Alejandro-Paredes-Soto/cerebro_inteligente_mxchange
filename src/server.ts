@@ -1,12 +1,34 @@
-import express from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import { SmartPricingEngine } from "./utils/smart.pricing";
 import { ExchangeConfig, ExternalRate, MarketSnapshot, SmartPricingResult, SystemMetrics } from "./interfaces/Pricing.type";
-import { ExternalRatesScraper, type ExternalRateSourceStatus } from "./utils/external-rates-scraper.service";
+import {
+  ExternalRatesScraper,
+  type RegionalCompetitorScrapeSource,
+  type RegionalCompetitorScrapeStatus,
+} from "./utils/external-rates-scraper.service";
+import { crawl4aiBaseUrl, verifyCrawl4aiHealth } from "./utils/rate-scrape.providers";
+import fs from "node:fs";
+import path from "node:path";
 
-dotenv.config({ path: ".env.local" });
+function resolveEnvFile(): string {
+  if (process.env.ENV_FILE) return process.env.ENV_FILE;
+  const candidates = [
+    process.env.APP_ENV === "production" || process.env.NODE_ENV === "production" ? ".env.prod" : ".env.local",
+    ".env.local",
+    ".env.prod",
+    ".env",
+  ];
+  for (const candidate of candidates) {
+    const fullPath = path.resolve(process.cwd(), candidate);
+    if (fs.existsSync(fullPath)) return candidate;
+  }
+  return ".env.local";
+}
+
+dotenv.config({ path: resolveEnvFile() });
 
 const app = express();
 
@@ -17,9 +39,18 @@ app.use(express.urlencoded({ extended: false }));
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:4000";
 const BRAIN_API_KEY = process.env.BRAIN_API_KEY || "mxchange-brain-secret-key-2026";
 const BRAIN_BRANCH_ID = process.env.BRAIN_BRANCH_ID || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const SCRAPER_CACHE_MINUTES = Number(process.env.SCRAPER_CACHE_MINUTES || 30);
-const SCRAPER_TIMEOUT_MS = Number(process.env.SCRAPER_TIMEOUT_MS || 15000);
+// Peso (0..1) de la competencia regional de Sonora en el ancla mezclada FIX + regional.
+// 0 = solo FIX (comportamiento anterior); 0.5 = mitad y mitad (default).
+const REGIONAL_ANCHOR_WEIGHT = Number(process.env.REGIONAL_ANCHOR_WEIGHT ?? 0.5);
+
+// MODO SIMULACIÓN (dry-run): en develop el cerebro calcula y muestra lo que PROPONDRÍA,
+// pero NO modifica ninguna tasa (no llama a /brain/update-rates). Solo en producción publica.
+// Se activa por entorno (APP_ENV/NODE_ENV) y se puede forzar con BRAIN_DRY_RUN=true|false.
+const APP_ENV = (process.env.APP_ENV || process.env.NODE_ENV || "development").toLowerCase();
+const DRY_RUN = process.env.BRAIN_DRY_RUN != null
+  ? /^(1|true|yes|on)$/i.test(process.env.BRAIN_DRY_RUN)
+  : APP_ENV !== "production";
+
 const CYCLE_INTERVAL_MS = 5 * 60 * 1000;
 
 type BrainLogLevel = "info" | "warn" | "error";
@@ -53,6 +84,7 @@ type PublishedRate = {
   sellRate: number;
   reason: string | null;
   appliedAt: string;
+  simulated?: boolean; // true = calculado en modo simulación (NO se publicó al backend)
 };
 
 type BranchRunState = {
@@ -67,6 +99,22 @@ type BranchRunState = {
   publishedRates: PublishedRate | null;
 };
 
+type BrainCompetitorSource = {
+  id: number;
+  source: string;
+  buyRate: number | null;
+  sellRate: number | null;
+  fetchedAt: string | null;
+  scrapeUrl: string | null;
+  scrapeEnabled: boolean;
+  scrapedToday: boolean; // true = ya se scrapeó hoy (según last_scraped_at en BD); no re-scrapear en auto
+};
+
+type RegionalCompetitorFetchResult = {
+  rates: ExternalRate[];
+  statuses: RegionalCompetitorScrapeStatus[];
+};
+
 type BrainMonitorState = {
   service: {
     name: string;
@@ -75,6 +123,13 @@ type BrainMonitorState = {
     backendUrl: string;
     branchFilter: string | null;
     intervalMs: number;
+    appEnv: string;
+    dryRun: boolean; // true = simulación: calcula pero NO modifica tasas
+    spreadConfig?: {
+      minSpreadCents: number;
+      startingSpreadCents: number;
+      maxSpreadCents: number;
+    };
   };
   currentCycle: {
     cycleId: number;
@@ -87,7 +142,9 @@ type BrainMonitorState = {
     processedBranches: number;
   };
   managedBranches: BranchSummary[];
-  latestExternalRateStatus: ExternalRateSourceStatus[];
+  /** @deprecated Ya no hay fuentes nacionales (Monex/BBVA). Siempre []. */
+  latestExternalRateStatus: [];
+  latestRegionalCompetitorStatus: RegionalCompetitorScrapeStatus[];
   latestBranchRuns: Record<string, BranchRunState>;
   eventFeed: BrainEvent[];
 };
@@ -100,6 +157,8 @@ const monitorState: BrainMonitorState = {
     backendUrl: BACKEND_URL,
     branchFilter: BRAIN_BRANCH_ID || null,
     intervalMs: CYCLE_INTERVAL_MS,
+    appEnv: APP_ENV,
+    dryRun: DRY_RUN,
   },
   currentCycle: {
     cycleId: 0,
@@ -113,6 +172,7 @@ const monitorState: BrainMonitorState = {
   },
   managedBranches: [],
   latestExternalRateStatus: [],
+  latestRegionalCompetitorStatus: [],
   latestBranchRuns: {},
   eventFeed: [],
 };
@@ -130,17 +190,24 @@ const baseConfig: ExchangeConfig = {
   targetUsdInventory: 50000,
   volatilityThreshold: 0.4,
   significantChangePercent: 0.5,
+  regionalAnchorWeight: Number.isFinite(REGIONAL_ANCHOR_WEIGHT) ? REGIONAL_ANCHOR_WEIGHT : 0.5,
+};
+
+// Exponer la escala de centavos (piso / arranque / techo) en el monitor para que
+// la UI muestre si el spread sube o baja respecto al arranque del día (lo del audio de Miguel).
+monitorState.service.spreadConfig = {
+  minSpreadCents: baseConfig.minSpreadCents,
+  startingSpreadCents: baseConfig.startingSpreadCents,
+  maxSpreadCents: baseConfig.maxSpreadCents,
 };
 
 const engine = new SmartPricingEngine(baseConfig);
 const externalRatesScraper = new ExternalRatesScraper({
-  cacheMinutes: Number.isFinite(SCRAPER_CACHE_MINUTES) ? SCRAPER_CACHE_MINUTES : 30,
-  timeoutMs: Number.isFinite(SCRAPER_TIMEOUT_MS) ? SCRAPER_TIMEOUT_MS : 15000,
-  model: OPENAI_MODEL,
   onEvent: (event) => pushBrainEvent(event.level, "fetch_external_rates", event.message, event.data),
 });
 const previousSnapshots = new Map<number, MarketSnapshot>();
 let brainEventId = 0;
+let regionalCompetitorResultForCycle: RegionalCompetitorFetchResult | null = null;
 
 function sanitizeError(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -173,6 +240,7 @@ function pushBrainEvent(
 }
 
 function beginCycle() {
+  regionalCompetitorResultForCycle = null;
   monitorState.currentCycle = {
     cycleId: monitorState.currentCycle.cycleId + 1,
     stage: "fetch_metrics",
@@ -238,6 +306,15 @@ function setBranchRun(branch: BranchSummary, patch: Partial<BranchRunState>) {
 app.get("/monitor", (_req, res) => {
   res.json(monitorState);
 });
+
+function requireBrainActionApiKey(req: Request, res: Response, next: NextFunction) {
+  const providedKey = req.headers["x-brain-api-key"];
+  if (providedKey !== BRAIN_API_KEY) {
+    return res.status(401).json({ message: "invalid brain api key" });
+  }
+
+  next();
+}
 
 async function fetchManagedBranches(): Promise<BranchSummary[]> {
   try {
@@ -354,15 +431,298 @@ async function updateSystemRates(branch: BranchSummary, buyRate: number, sellRat
   }
 }
 
+function isPlausibleRate(buyRate: number | null, sellRate: number | null): boolean {
+  if (buyRate === null || sellRate === null) return false;
+  if (!Number.isFinite(buyRate) || !Number.isFinite(sellRate)) return false;
+  if (buyRate <= 10 || buyRate >= 30 || sellRate <= 10 || sellRate >= 30) return false;
+  if (sellRate < buyRate) return false;
+  return true;
+}
+
+function safeDate(value: string | null): Date | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function normalizeBrainCompetitor(item: unknown): BrainCompetitorSource | null {
+  const c = item as Record<string, unknown>;
+  const id = Number(c.id);
+  if (!Number.isInteger(id) || id <= 0) return null;
+
+  const scrapeUrl = typeof c.scrapeUrl === "string" && c.scrapeUrl.trim()
+    ? c.scrapeUrl.trim()
+    : null;
+
+  return {
+    id,
+    source: String(c.source || "Competidor"),
+    buyRate: c.buyRate == null ? null : Number(c.buyRate),
+    sellRate: c.sellRate == null ? null : Number(c.sellRate),
+    fetchedAt: c.fetchedAt ? String(c.fetchedAt) : null,
+    scrapeUrl,
+    scrapeEnabled: Boolean(c.scrapeEnabled),
+    scrapedToday: Boolean(c.scrapedToday),
+  };
+}
+
+function buildManualCompetitorRate(competitor: BrainCompetitorSource): ExternalRate | null {
+  if (!isPlausibleRate(competitor.buyRate, competitor.sellRate)) return null;
+  return {
+    source: competitor.source,
+    buyRate: competitor.buyRate as number,
+    sellRate: competitor.sellRate as number,
+    fetchedAt: safeDate(competitor.fetchedAt) ?? new Date(),
+    origin: "regional",
+  };
+}
+
+function buildManualCompetitorStatus(
+  competitor: BrainCompetitorSource,
+  rate: ExternalRate | null
+): RegionalCompetitorScrapeStatus {
+  return {
+    id: competitor.id,
+    source: competitor.source,
+    configuredName: competitor.source,
+    scrapedName: null,
+    url: competitor.scrapeUrl,
+    status: rate ? "manual" : "skipped",
+    buyRate: rate?.buyRate ?? null,
+    sellRate: rate?.sellRate ?? null,
+    message: rate
+      ? "Sin scraping activo; se usa la tasa capturada manualmente."
+      : "No tiene scraping activo ni tasas manuales válidas.",
+    checkedAt: rate?.fetchedAt.toISOString() ?? null,
+    usedSource: rate ? "manual" : "none",
+  };
+}
+
+// Competidor con scraping activo que YA se consultó hoy: reutilizamos el dato guardado (NO re-scrapeamos).
+function buildCachedTodayStatus(
+  competitor: BrainCompetitorSource,
+  rate: ExternalRate | null
+): RegionalCompetitorScrapeStatus {
+  return {
+    id: competitor.id,
+    source: competitor.source,
+    configuredName: competitor.source,
+    scrapedName: null,
+    url: competitor.scrapeUrl,
+    status: rate ? "success" : "skipped",
+    buyRate: rate?.buyRate ?? null,
+    sellRate: rate?.sellRate ?? null,
+    message: rate
+      ? "Ya se consultó hoy; se reutiliza el tipo de cambio del día. El próximo scraping automático es mañana (usa el botón Scrapear para forzarlo ahora)."
+      : "Ya se intentó hoy pero no hay tasa válida guardada; usa el botón Scrapear para reintentar.",
+    checkedAt: safeDate(competitor.fetchedAt)?.toISOString() ?? rate?.fetchedAt.toISOString() ?? null,
+    usedSource: rate ? "scrape" : "none",
+  };
+}
+
+function buildRegionalScrapeSource(competitor: BrainCompetitorSource): RegionalCompetitorScrapeSource {
+  return {
+    id: competitor.id,
+    name: competitor.source,
+    url: competitor.scrapeUrl as string,
+    manualBuyRate: competitor.buyRate,
+    manualSellRate: competitor.sellRate,
+    fetchedAt: safeDate(competitor.fetchedAt),
+  };
+}
+
+async function reportCompetitorScrapeStatus(status: RegionalCompetitorScrapeStatus) {
+  if (status.status === "manual" || status.status === "skipped") return;
+
+  try {
+    const response = await fetch(`${BACKEND_URL}/brain/competitors/${status.id}/scrape-result`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-brain-api-key": BRAIN_API_KEY,
+      },
+      body: JSON.stringify({
+        status: status.status,
+        buyRate: status.buyRate,
+        sellRate: status.sellRate,
+        scrapedName: status.scrapedName,
+        message: status.message,
+        checkedAt: status.checkedAt,
+      }),
+    });
+
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+  } catch (error) {
+    pushBrainEvent("warn", "fetch_external_rates", "No se pudo guardar el resultado de scraping del competidor", {
+      competitorId: status.id,
+      source: status.source,
+      status: status.status,
+      error: sanitizeError(error),
+    });
+  }
+}
+
+async function fetchRegionalCompetitors(): Promise<RegionalCompetitorFetchResult> {
+  if (regionalCompetitorResultForCycle) return regionalCompetitorResultForCycle;
+
+  try {
+    const response = await fetch(`${BACKEND_URL}/brain/competitors`, {
+      headers: { "x-brain-api-key": BRAIN_API_KEY },
+    });
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+    const data = await response.json();
+    const raw: unknown[] = Array.isArray(data?.competitors) ? data.competitors : [];
+    const competitors = raw
+      .map(normalizeBrainCompetitor)
+      .filter((item): item is BrainCompetitorSource => Boolean(item));
+
+    const manualRates: ExternalRate[] = [];
+    const manualStatuses: RegionalCompetitorScrapeStatus[] = [];
+    const cachedRates: ExternalRate[] = [];
+    const cachedStatuses: RegionalCompetitorScrapeStatus[] = [];
+    const scrapeSources: RegionalCompetitorScrapeSource[] = [];
+
+    for (const competitor of competitors) {
+      if (competitor.scrapeEnabled && competitor.scrapeUrl) {
+        // Gate diario: si ya se scrapeó hoy (last_scraped_at en BD), NO volvemos a scrapear;
+        // reutilizamos el dato guardado del día. Esto sobrevive a reinicios del server.
+        if (competitor.scrapedToday) {
+          const cachedRate = buildManualCompetitorRate(competitor);
+          if (cachedRate) cachedRates.push(cachedRate);
+          cachedStatuses.push(buildCachedTodayStatus(competitor, cachedRate));
+          continue;
+        }
+        scrapeSources.push(buildRegionalScrapeSource(competitor));
+        continue;
+      }
+
+      const manualRate = buildManualCompetitorRate(competitor);
+      if (manualRate) manualRates.push(manualRate);
+      manualStatuses.push(buildManualCompetitorStatus(competitor, manualRate));
+    }
+
+    const scraped = await externalRatesScraper.scrapeRegionalCompetitors(scrapeSources);
+    await Promise.all(scraped.statuses.map(reportCompetitorScrapeStatus));
+
+    const result: RegionalCompetitorFetchResult = {
+      rates: [...manualRates, ...cachedRates, ...scraped.rates],
+      statuses: [...manualStatuses, ...cachedStatuses, ...scraped.statuses],
+    };
+
+    monitorState.latestRegionalCompetitorStatus = result.statuses;
+    regionalCompetitorResultForCycle = result;
+
+    pushBrainEvent(result.rates.length ? "info" : "warn", "fetch_external_rates", "Competencia regional (Sonora) cargada", {
+      count: result.rates.length,
+      configured: competitors.length,
+      scrapedNow: scrapeSources.length,
+      reusedToday: cachedRates.length,
+      sources: result.rates.map((rate) => rate.source),
+      scrapeStatus: result.statuses.map((status) => ({
+        source: status.source,
+        status: status.status,
+        usedSource: status.usedSource,
+      })),
+    });
+    return result;
+  } catch (error) {
+    pushBrainEvent("warn", "fetch_external_rates", "No se pudo obtener la competencia regional; el motor usará solo FIX", {
+      error: sanitizeError(error),
+    });
+    const result: RegionalCompetitorFetchResult = { rates: [], statuses: [] };
+    monitorState.latestRegionalCompetitorStatus = result.statuses;
+    regionalCompetitorResultForCycle = result;
+    return result;
+  }
+}
+
+function mergeRegionalCompetitorStatus(status: RegionalCompetitorScrapeStatus) {
+  monitorState.latestRegionalCompetitorStatus = [
+    status,
+    ...monitorState.latestRegionalCompetitorStatus.filter((item) => item.id !== status.id),
+  ].sort((a, b) => a.source.localeCompare(b.source, "es-MX"));
+}
+
+async function scrapeRegionalCompetitorNow(competitorId: number): Promise<RegionalCompetitorScrapeStatus> {
+  const response = await fetch(`${BACKEND_URL}/brain/competitors`, {
+    headers: { "x-brain-api-key": BRAIN_API_KEY },
+  });
+  if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+  const data = await response.json();
+  const raw: unknown[] = Array.isArray(data?.competitors) ? data.competitors : [];
+  const competitor = raw
+    .map(normalizeBrainCompetitor)
+    .filter((item): item is BrainCompetitorSource => Boolean(item))
+    .find((item) => item.id === competitorId);
+
+  if (!competitor) {
+    throw new Error("competitor_not_found_or_inactive");
+  }
+  if (!competitor.scrapeEnabled || !competitor.scrapeUrl) {
+    throw new Error("competitor_scraping_not_enabled");
+  }
+
+  pushBrainEvent("info", "fetch_external_rates", "Scraping manual solicitado para competidor regional", {
+    competitorId: competitor.id,
+    source: competitor.source,
+    url: competitor.scrapeUrl,
+  });
+
+  const scraped = await externalRatesScraper.scrapeRegionalCompetitors([buildRegionalScrapeSource(competitor)]);
+  const status = scraped.statuses[0];
+  if (!status) throw new Error("competitor_scrape_returned_no_status");
+
+  await reportCompetitorScrapeStatus(status);
+  mergeRegionalCompetitorStatus(status);
+  regionalCompetitorResultForCycle = null;
+
+  pushBrainEvent(status.status === "success" ? "info" : "warn", "fetch_external_rates", "Scraping manual de competidor terminado", {
+    competitorId: status.id,
+    source: status.source,
+    status: status.status,
+    buyRate: status.buyRate,
+    sellRate: status.sellRate,
+  });
+
+  return status;
+}
+
+app.post("/competitors/:id/scrape-now", requireBrainActionApiKey, async (req, res) => {
+  try {
+    const competitorId = Number(req.params.id);
+    if (!Number.isInteger(competitorId) || competitorId <= 0) {
+      return res.status(400).json({ message: "id de competidor inválido" });
+    }
+
+    const status = await scrapeRegionalCompetitorNow(competitorId);
+    return res.json({ ok: true, status });
+  } catch (error) {
+    const message = sanitizeError(error);
+    pushBrainEvent("warn", "fetch_external_rates", "No se pudo ejecutar scraping manual del competidor", {
+      competitorId: req.params.id,
+      error: message,
+    });
+
+    const statusCode = message === "competitor_not_found_or_inactive" ? 404
+      : message === "competitor_scraping_not_enabled" ? 400
+      : 500;
+    return res.status(statusCode).json({ message });
+  }
+});
+
 async function fetchExternalRates(branch: BranchSummary): Promise<ExternalRate[]> {
-  const rates = await externalRatesScraper.getExternalRates();
-  monitorState.latestExternalRateStatus = externalRatesScraper.getSourceStatuses();
-  pushBrainEvent(rates.length ? "info" : "warn", "fetch_external_rates", "Referencias externas disponibles para sucursal", {
+  const regionalResult = await fetchRegionalCompetitors();
+  const rates = regionalResult.rates;
+
+  pushBrainEvent(rates.length ? "info" : "warn", "fetch_external_rates", "Competencia regional disponible para sucursal", {
     branchId: branch.id,
     branchName: branch.name,
-    sources: rates.map((rate) => rate.source),
-    cache: externalRatesScraper.getCacheStatus(),
-    sourceStatus: monitorState.latestExternalRateStatus,
+    regionalSources: rates.map((rate) => rate.source),
+    regionalStatus: monitorState.latestRegionalCompetitorStatus,
+    scraper: "crawl4ai",
+    crawl4aiBaseUrl: crawl4aiBaseUrl(),
   });
   return rates;
 }
@@ -382,7 +742,10 @@ function buildSystemMetrics(rawMetrics: any): SystemMetrics {
 }
 
 function logBranchResult(branch: BranchSummary, systemMetrics: SystemMetrics, result: SmartPricingResult) {
-  const src = result.analysis.referenceSource === "fix_banxico" ? "🏦 FIX Banxico" : "📊 Promedio Externo";
+  const src =
+    result.analysis.referenceSource === "fix_banxico" ? "🏦 FIX Banxico"
+    : result.analysis.referenceSource === "blended" ? `⚖️ FIX + Regional (w=${result.analysis.regionalAnchorWeight.toFixed(2)})`
+    : "📊 Promedio Externo";
   const dev = result.analysis.fixDeviation;
   const devStr = dev !== 0 ? ` (mercado regional ${dev > 0 ? "+" : ""}${(dev * 100).toFixed(1)}¢ vs FIX)` : "";
   const dailySpread = systemMetrics.daily_spread ?? (systemMetrics.sell_avg - systemMetrics.buy_avg);
@@ -484,6 +847,27 @@ async function processBranch(branch: BranchSummary) {
     });
   }
 
+  if (DRY_RUN) {
+    // Modo simulación: registramos lo que SE PUBLICARÍA para que el monitor lo muestre,
+    // pero NO tocamos el backend.
+    setBranchRun(branch, {
+      publishedRates: {
+        buyRate: result.adjustment.adjustedBuyRate,
+        sellRate: result.adjustment.adjustedSellRate,
+        reason: result.adjustment.adjustmentReason,
+        appliedAt: new Date().toISOString(),
+        simulated: true,
+      },
+    });
+    pushBrainEvent("info", "publish_rates", "Modo simulación (develop): tasas calculadas pero NO publicadas", {
+      branchId: branch.id,
+      branchName: branch.name,
+      buyRate: result.adjustment.adjustedBuyRate,
+      sellRate: result.adjustment.adjustedSellRate,
+    });
+    return;
+  }
+
   await updateSystemRates(
     branch,
     result.adjustment.adjustedBuyRate,
@@ -558,10 +942,33 @@ async function runPricingCycle() {
   }
 }
 
-runPricingCycle();
-setInterval(runPricingCycle, CYCLE_INTERVAL_MS);
+async function boot() {
+  const health = await verifyCrawl4aiHealth();
+  if (health.ok) {
+    pushBrainEvent("info", "boot", "Crawl4AI disponible para scraping de competidores", {
+      baseUrl: crawl4aiBaseUrl(),
+    });
+  } else {
+    pushBrainEvent("error", "boot", "Crawl4AI no está disponible; el scraping de competidores fallará", {
+      baseUrl: crawl4aiBaseUrl(),
+      error: health.error,
+      hint: "docker compose up -d crawl4ai",
+    });
+    console.error(`[cerebro] Crawl4AI no responde en ${crawl4aiBaseUrl()}: ${health.error}`);
+  }
+
+  runPricingCycle();
+  setInterval(runPricingCycle, CYCLE_INTERVAL_MS);
+}
 
 const port = process.env.PORT || 4001;
 app.listen(port, () => {
   console.log("Server running on port " + port);
+  console.log(`Scraping: Crawl4AI en ${crawl4aiBaseUrl()}`);
+  console.log(
+    DRY_RUN
+      ? `🧪 MODO SIMULACIÓN (entorno=${APP_ENV}): calcula y muestra, pero NO modifica tasas.`
+      : `🚀 MODO PRODUCCIÓN (entorno=${APP_ENV}): publica tasas reales al backend.`
+  );
+  void boot();
 });

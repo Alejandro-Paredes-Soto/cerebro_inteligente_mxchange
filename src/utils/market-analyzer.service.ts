@@ -19,29 +19,50 @@ export class MarketAnalyzer {
     const avgSell = rates.length > 0 ? this.average(rates.map((r) => r.sellRate)) : metrics.fix_banxico!;
     const externalMidpoint = (avgBuy + avgSell) / 2;
 
-    // ── ANCLA DEL PRECIO DE REFERENCIA ─────────────────────────────
-    // Prioridad: FIX Banxico (tipo de cambio interbancario oficial)
-    // Fallback:  Promedio del mercado externo regional (cuando no hay FIX)
+    // Solo la competencia REGIONAL (Sonora) alimenta el ancla. El scraping nacional
+    // (origin "national") queda para desviación, alertas y pantalla, pero NO mueve el precio.
+    const regionalRates = rates.filter((r) => r.origin === "regional");
+    const regionalMidpoint = regionalRates.length > 0
+      ? this.average(regionalRates.map((r) => (r.buyRate + r.sellRate) / 2))
+      : null;
+
+    // ── ANCLA DEL PRECIO DE REFERENCIA (referencia cruzada — Opción B) ──────
+    // En lugar de usar solo el FIX, mezclamos FIX + competencia regional de Sonora:
+    //   referenceBaseRate = (1 - w) * FIX + w * regionalMidpoint
+    // donde w = regionalAnchorWeight. Esto es lo que pidió Miguel: que el precio
+    // reaccione al mercado de su zona, no solo al interbancario nacional.
     //
-    // El FIX es publicado por Banxico a las ~12pm cada día hábil.
-    // Antes de esa hora, el sistema usa el último FIX disponible (cacheado en BD).
+    // Cadena de respaldo (nunca truena):
+    //   1. FIX + regional → mezcla ponderada               (referenceSource "blended")
+    //   2. Solo FIX                                          (referenceSource "fix_banxico")
+    //   3. Solo regional / externo                           (referenceSource "external_avg")
+    const hasFix = !!(metrics.fix_banxico && metrics.fix_banxico > 10);
+    const w = this.clamp01(this.config.regionalAnchorWeight ?? 0);
+
     let referenceBaseRate: number;
     let referenceSource: MarketAnalysis['referenceSource'];
+    let appliedRegionalWeight = 0;
 
-    if (metrics.fix_banxico && metrics.fix_banxico > 10) {
-      referenceBaseRate = metrics.fix_banxico;
-      referenceSource   = 'fix_banxico';
+    if (hasFix && regionalMidpoint != null && w > 0) {
+      referenceBaseRate = (1 - w) * metrics.fix_banxico! + w * regionalMidpoint;
+      referenceSource = 'blended';
+      appliedRegionalWeight = w;
+    } else if (hasFix) {
+      referenceBaseRate = metrics.fix_banxico!;
+      referenceSource = 'fix_banxico';
     } else {
-      // Sin FIX disponible → usamos el punto medio del mercado externo regional
-      referenceBaseRate = externalMidpoint;
-      referenceSource   = 'external_avg';
+      // Sin FIX → usamos el mercado disponible (regional si existe, si no el externo)
+      referenceBaseRate = regionalMidpoint ?? externalMidpoint;
+      referenceSource = 'external_avg';
+      appliedRegionalWeight = regionalMidpoint != null ? 1 : 0;
     }
 
     // Cuánto se aleja el mercado regional del FIX oficial
     // Positivo = el mercado regional es más caro que el FIX
     // Negativo = el mercado regional está por debajo del FIX
-    const fixDeviation = metrics.fix_banxico
-      ? externalMidpoint - metrics.fix_banxico
+    const marketMidpointForDeviation = regionalMidpoint ?? externalMidpoint;
+    const fixDeviation = hasFix
+      ? marketMidpointForDeviation - metrics.fix_banxico!
       : 0;
 
     // ── VOLATILIDAD ───────────────────────────────────────
@@ -75,6 +96,8 @@ export class MarketAnalyzer {
       averageExternalSell: avgSell,
       referenceBaseRate,
       referenceSource,
+      regionalMidpoint,
+      regionalAnchorWeight: appliedRegionalWeight,
       fixDeviation,
       volatilityScore,
       inventoryPressure,
@@ -99,6 +122,11 @@ export class MarketAnalyzer {
 
   private average(values: number[]): number {
     return values.reduce((a, b) => a + b, 0) / values.length;
+  }
+
+  private clamp01(value: number): number {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(1, value));
   }
 
   private coefficientOfVariation(values: number[]): number {

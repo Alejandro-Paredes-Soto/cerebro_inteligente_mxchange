@@ -3,6 +3,9 @@ export interface ExternalRate {
   buyRate: number; // tipo de cambio compra
   sellRate: number; // tipo de cambio venta
   fetchedAt: Date;
+  // origin: "regional" = competencia local de Sonora (sí jala el precio / ancla)
+  //         "national" = scraping Monex/BBVA nacional (solo desviación, alertas y pantalla)
+  origin?: "regional" | "national";
 }
 
 export interface SystemMetrics {
@@ -27,8 +30,10 @@ export interface MarketSnapshot {
 export interface MarketAnalysis {
   averageExternalBuy: number;
   averageExternalSell: number;
-  referenceBaseRate: number;   // Ancla de precio: FIX Banxico (preferido) o promedio externo
-  referenceSource: 'fix_banxico' | 'external_avg'; // De dónde viene la referencia
+  referenceBaseRate: number;   // Ancla de precio: mezcla FIX + competencia regional, o el fallback disponible
+  referenceSource: 'blended' | 'fix_banxico' | 'external_avg'; // De dónde viene la referencia
+  regionalMidpoint: number | null; // Punto medio promedio de la competencia regional (Sonora). null si no hay.
+  regionalAnchorWeight: number;    // Peso (0..1) que tuvo la competencia regional en el ancla mezclada
   fixDeviation: number;        // Cuánto se aleja el mercado regional del FIX (+ = regional más caro)
   volatilityScore: number;     // 0 a 1 (0 = estable, 1 = muy volátil)
 
@@ -111,4 +116,10 @@ export interface ExchangeConfig {
 
   volatilityThreshold: number;       // 0-1, a partir de qué score se considera volátil
   significantChangePercent: number;  // % mínimo para disparar alerta
+
+  // REFERENCIA CRUZADA (lo que pidió Miguel): el ancla no es solo el FIX, sino una
+  // mezcla ponderada FIX + competencia regional de Sonora.
+  //   referenceBaseRate = (1 - regionalAnchorWeight) * FIX + regionalAnchorWeight * regionalMidpoint
+  // 0 = solo FIX (comportamiento anterior); 1 = solo competencia regional; 0.5 = mitad y mitad.
+  regionalAnchorWeight: number;
 }
