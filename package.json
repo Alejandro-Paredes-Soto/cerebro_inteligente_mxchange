@@ -10,6 +10,8 @@
     "llm-scraper": "^1.6.0",
     "mysql2": "^3.22.2",
     "playwright": "^1.60.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "zod": "^3.25.76"
   },
   "name": "cerebro_inteligente_mxchange",
@@ -27,7 +29,12 @@
     "typescript": "^6.0.3"
   },
   "scripts": {
-    "dev": "npx kill-port 10000 && nodemon  src/server.ts"
+    "dev": "npx kill-port 10000 && nodemon  src/server.ts",
+    "crawl4ai:up": "docker compose up -d crawl4ai",
+    "crawl4ai:down": "docker compose down",
+    "crawl4ai:logs": "docker compose logs -f crawl4ai",
+    "test:scrapers": "npx ts-node scripts/compare-scrape-providers.ts",
+    "deploy:prod": "bash deploy-prod.sh"
   },
   "keywords": [],
   "author": "",
