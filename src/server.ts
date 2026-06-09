@@ -15,17 +15,12 @@ import path from "node:path";
 
 function resolveEnvFile(): string {
   if (process.env.ENV_FILE) return process.env.ENV_FILE;
-  const candidates = [
-    process.env.APP_ENV === "production" || process.env.NODE_ENV === "production" ? ".env.prod" : ".env.local",
-    ".env.local",
-    ".env.prod",
-    ".env",
-  ];
+  const candidates = [".env", ".env.prod", ".env.local"];
   for (const candidate of candidates) {
     const fullPath = path.resolve(process.cwd(), candidate);
     if (fs.existsSync(fullPath)) return candidate;
   }
-  return ".env.local";
+  return ".env";
 }
 
 dotenv.config({ path: resolveEnvFile() });

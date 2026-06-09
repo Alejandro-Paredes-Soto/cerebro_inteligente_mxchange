@@ -19,6 +19,11 @@ if [ ! -f .llm.env ]; then
   exit 1
 fi
 
+if [ ! -f .env ] && [ ! -f .env.prod ]; then
+  echo "ERROR: falta .env (o .env.prod) con la config del cerebro"
+  exit 1
+fi
+
 docker compose pull crawl4ai
 docker compose up -d crawl4ai
 

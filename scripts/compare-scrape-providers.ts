@@ -6,6 +6,7 @@
  *   npx ts-node scripts/compare-scrape-providers.ts --url=https://www.dimesa.com/
  */
 import dotenv from "dotenv";
+import fs from "node:fs";
 import path from "node:path";
 import {
   crawl4aiRateScrape,
@@ -14,7 +15,28 @@ import {
   crawl4aiBaseUrl,
 } from "../src/utils/rate-scrape.providers";
 
-dotenv.config({ path: path.join(__dirname, "..", ".env.local") });
+function loadEnvFile() {
+  const root = path.join(__dirname, "..");
+  const candidates = [
+    process.env.ENV_FILE,
+    ".env",
+    ".env.prod",
+    ".env.local",
+  ].filter((item): item is string => Boolean(item));
+
+  for (const candidate of candidates) {
+    const fullPath = path.join(root, candidate);
+    if (fs.existsSync(fullPath)) {
+      dotenv.config({ path: fullPath });
+      console.log(`Variables cargadas desde ${candidate}`);
+      return;
+    }
+  }
+
+  console.warn("No se encontró .env.prod ni .env.local; se usan solo variables del sistema.");
+}
+
+loadEnvFile();
 
 const DEFAULT_URLS = [
   "https://www.dimesa.com/",

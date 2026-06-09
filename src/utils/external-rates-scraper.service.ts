@@ -1,5 +1,5 @@
 import { ExternalRate } from "../interfaces/Pricing.type";
-import { rateScrape, scrapeProviderLabel, scraperConfigured } from "./rate-scrape.providers";
+import { rateScrape, scrapeProviderLabel } from "./rate-scrape.providers";
 
 type ScraperLogLevel = "info" | "warn" | "error";
 
@@ -88,10 +88,6 @@ export class ExternalRatesScraper {
     const statuses: RegionalCompetitorScrapeStatus[] = [];
 
     if (!sources.length) return { rates, statuses };
-
-    if (!scraperConfigured()) {
-      this.emit("warn", `${this.providerLabel} requiere OPENAI_API_KEY; se usarán solo las tasas manuales`);
-    }
 
     this.emit("info", `Consultando competencia regional con ${this.providerLabel}`, {
       count: sources.length,

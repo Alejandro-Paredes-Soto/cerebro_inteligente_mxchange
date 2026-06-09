@@ -54,8 +54,9 @@ function openAiModel(): string {
   return process.env.OPENAI_MODEL || "gpt-4o-mini";
 }
 
+// Crawl4AI lee OPENAI_API_KEY dentro del contenedor (.llm.env), no en el proceso Node.
 export function scraperConfigured(): boolean {
-  return Boolean(process.env.OPENAI_API_KEY);
+  return true;
 }
 
 function crawl4aiDockerHint(): string {
@@ -81,10 +82,6 @@ export async function verifyCrawl4aiHealth(): Promise<{ ok: boolean; error: stri
 }
 
 export async function crawl4aiRateScrape(url: string): Promise<RateScrapeResult> {
-  if (!scraperConfigured()) {
-    return { json: null, error: "OPENAI_API_KEY no está configurada (Crawl4AI la usa para extraer el JSON)" };
-  }
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), scrapeTimeoutMs());
   const waitSeconds = scrapeWaitMs() / 1000;
