@@ -78,11 +78,31 @@ export class MarketAnalyzer {
       inventoryPressure = (metrics.usd_inventory - this.config.targetUsdInventory) / this.config.targetUsdInventory;
     }
 
-    // ── NIVEL DE DEMANDA (ESCALONES DE MIGUEL) ──────────────────
-    // Por cada N operaciones de venta (la casa vendió USD al cliente), subimos 1 escalón
+    // ── UMBRAL DINÁMICO + ESCALONES DE DEMANDA (MIGUEL) ──────────────────
+    // El umbral ya no es fijo (100): usamos el promedio diario histórico de la sucursal.
+    // Si no hay historial suficiente, caemos al operationsThreshold de la config.
+    const configThreshold = this.config.operationsThreshold > 0 ? this.config.operationsThreshold : 100;
+    const avgDailySell = metrics.avg_daily_sell_operations || 0;
+    const avgDailyBuy = metrics.avg_daily_buy_operations || 0;
+
+    const effectiveSellThreshold = metrics.effective_sell_threshold > 0
+      ? metrics.effective_sell_threshold
+      : (avgDailySell >= 5 ? Math.max(5, Math.round(avgDailySell)) : configThreshold);
+
+    const effectiveBuyThreshold = metrics.effective_buy_threshold > 0
+      ? metrics.effective_buy_threshold
+      : (avgDailyBuy >= 5 ? Math.max(5, Math.round(avgDailyBuy)) : configThreshold);
+
+    // Por cada N operaciones de venta (cliente compra USD), subimos 1 escalón la venta
     let sellDemandLevel = 0;
-    if (this.config.operationsThreshold > 0 && metrics.total_sell_operations !== undefined) {
-      sellDemandLevel = Math.floor(metrics.total_sell_operations / this.config.operationsThreshold);
+    if (effectiveSellThreshold > 0 && metrics.total_sell_operations !== undefined) {
+      sellDemandLevel = Math.floor(metrics.total_sell_operations / effectiveSellThreshold);
+    }
+
+    // Por cada N operaciones de compra (cliente vende USD a la casa), bajamos 1 escalón la compra
+    let buyDemandLevel = 0;
+    if (effectiveBuyThreshold > 0 && metrics.total_buy_operations !== undefined) {
+      buyDemandLevel = Math.floor(metrics.total_buy_operations / effectiveBuyThreshold);
     }
 
     const isVolatile = volatilityScore >= this.config.volatilityThreshold;
@@ -102,6 +122,11 @@ export class MarketAnalyzer {
       volatilityScore,
       inventoryPressure,
       sellDemandLevel,
+      buyDemandLevel,
+      effectiveSellThreshold,
+      effectiveBuyThreshold,
+      avgDailySellOperations: avgDailySell,
+      avgDailyBuyOperations: avgDailyBuy,
       fifoAverageCost: typeof metrics.fifo_avg_cost === "number" && metrics.fifo_avg_cost > 0
         ? metrics.fifo_avg_cost
         : null,

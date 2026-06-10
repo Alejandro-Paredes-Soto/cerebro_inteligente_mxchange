@@ -18,6 +18,11 @@ export interface SystemMetrics {
   total_sell_operations: number; // Cuántas veces el cliente ha COMPRADO USD a la casa
   daily_spread?: number;
   daily_profit_mxn?: number;
+  // Promedios históricos (últimos ~14 días) para umbral dinámico de escalones
+  avg_daily_buy_operations: number;
+  avg_daily_sell_operations: number;
+  effective_buy_threshold: number;
+  effective_sell_threshold: number;
 }
 
 export interface MarketSnapshot {
@@ -39,7 +44,12 @@ export interface MarketAnalysis {
 
   // Métricas locales de presión
   inventoryPressure: number;   // > 0 exceso de USD, < 0 escasez de USD
-  sellDemandLevel: number;     // Nivel de demanda de venta (cuántos escalones subimos)
+  sellDemandLevel: number;     // Escalones por demanda de venta (clientes compran USD)
+  buyDemandLevel: number;      // Escalones por oferta de compra (clientes venden USD a la casa)
+  effectiveSellThreshold: number; // Umbral dinámico de ventas (promedio histórico o config)
+  effectiveBuyThreshold: number;  // Umbral dinámico de compras
+  avgDailySellOperations: number;
+  avgDailyBuyOperations: number;
   fifoAverageCost: number | null;
 
   isVolatile: boolean;
@@ -52,16 +62,20 @@ export interface PriceAdjustment {
   adjustedBuyRate: number;
   adjustedSellRate: number;
   buySpread: number; // Margen en centavos aplicado a la compra (ej. 0.20)
-  sellSpread: number; // Margen en centavos aplicado a la venta (ej. 0.21)
+  sellSpread: number; // Margen en centavos aplicado a la venta (efectivo, puede incluir FIFO)
+  strategyBuySpread: number;  // Spread de compra decidido por estrategia (antes de candados)
+  strategySellSpread: number; // Spread de venta decidido por estrategia (antes de FIFO)
   buyDelta: number; // diferencia vs precio anterior
   sellDelta: number;
   adjustmentReason: AdjustmentReason;
   fifoProtectionApplied: boolean;
+  fifoExtraSellSpread: number; // Cuántos centavos subió la venta por protección FIFO (0 si no aplica)
   minSafeSellRate: number | null;
 }
 
 export type AdjustmentReason =
   | "high_local_demand" // El negocio está vendiendo muchos USD (subir centavos)
+  | "high_usd_offer" // Muchos clientes le venden USD a la casa (bajar compra)
   | "excess_inventory" // El negocio tiene muchos USD (bajar precio de venta para sacar)
   | "volatile_market" // mercado volátil, proteger
   | "stable_market" // mercado estable, mantener base

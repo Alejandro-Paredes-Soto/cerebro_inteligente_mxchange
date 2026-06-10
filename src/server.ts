@@ -23,7 +23,8 @@ function resolveEnvFile(): string {
   return ".env";
 }
 
-dotenv.config({ path: resolveEnvFile() });
+// override: true → lo del .env manda sobre PM2/shell (evita que APP_ENV=production en ecosystem ignore tu .env local).
+dotenv.config({ path: resolveEnvFile(), override: true });
 
 const app = express();
 
@@ -42,9 +43,11 @@ const REGIONAL_ANCHOR_WEIGHT = Number(process.env.REGIONAL_ANCHOR_WEIGHT ?? 0.5)
 // pero NO modifica ninguna tasa (no llama a /brain/update-rates). Solo en producción publica.
 // Se activa por entorno (APP_ENV/NODE_ENV) y se puede forzar con BRAIN_DRY_RUN=true|false.
 const APP_ENV = (process.env.APP_ENV || process.env.NODE_ENV || "development").toLowerCase();
-const DRY_RUN = process.env.BRAIN_DRY_RUN != null
-  ? /^(1|true|yes|on)$/i.test(process.env.BRAIN_DRY_RUN)
-  : APP_ENV !== "production";
+const BRAIN_DRY_RUN_RAW = process.env.BRAIN_DRY_RUN?.trim().toLowerCase();
+const DRY_RUN =
+  BRAIN_DRY_RUN_RAW != null && BRAIN_DRY_RUN_RAW !== ""
+    ? /^(1|true|yes|on)$/i.test(BRAIN_DRY_RUN_RAW)
+    : APP_ENV !== "production";
 
 const CYCLE_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -120,6 +123,8 @@ type BrainMonitorState = {
     intervalMs: number;
     appEnv: string;
     dryRun: boolean; // true = simulación: calcula pero NO modifica tasas
+    brainDryRunEnv?: string | null;
+    envFile?: string;
     spreadConfig?: {
       minSpreadCents: number;
       startingSpreadCents: number;
@@ -154,6 +159,8 @@ const monitorState: BrainMonitorState = {
     intervalMs: CYCLE_INTERVAL_MS,
     appEnv: APP_ENV,
     dryRun: DRY_RUN,
+    brainDryRunEnv: process.env.BRAIN_DRY_RUN ?? null,
+    envFile: resolveEnvFile(),
   },
   currentCycle: {
     cycleId: 0,
@@ -172,6 +179,9 @@ const monitorState: BrainMonitorState = {
   eventFeed: [],
 };
 
+// Valores por defecto si el backend no tiene configuración guardada o no responde.
+// La configuración REAL (los centavos de Miguel) vive en el backend (tabla settings)
+// y se refresca al inicio de cada ciclo con refreshPricingConfig().
 const baseConfig: ExchangeConfig = {
   currentBuyRate: 17.10,
   currentSellRate: 17.50,
@@ -188,13 +198,19 @@ const baseConfig: ExchangeConfig = {
   regionalAnchorWeight: Number.isFinite(REGIONAL_ANCHOR_WEIGHT) ? REGIONAL_ANCHOR_WEIGHT : 0.5,
 };
 
+// Configuración efectiva del ciclo (backend → fallback a baseConfig)
+let activeConfig: ExchangeConfig = { ...baseConfig };
+
 // Exponer la escala de centavos (piso / arranque / techo) en el monitor para que
 // la UI muestre si el spread sube o baja respecto al arranque del día (lo del audio de Miguel).
-monitorState.service.spreadConfig = {
-  minSpreadCents: baseConfig.minSpreadCents,
-  startingSpreadCents: baseConfig.startingSpreadCents,
-  maxSpreadCents: baseConfig.maxSpreadCents,
-};
+function syncSpreadConfigToMonitor() {
+  monitorState.service.spreadConfig = {
+    minSpreadCents: activeConfig.minSpreadCents,
+    startingSpreadCents: activeConfig.startingSpreadCents,
+    maxSpreadCents: activeConfig.maxSpreadCents,
+  };
+}
+syncSpreadConfigToMonitor();
 
 const engine = new SmartPricingEngine(baseConfig);
 const externalRatesScraper = new ExternalRatesScraper({
@@ -263,14 +279,9 @@ function completeCycle(status: "success" | "error", error?: unknown) {
   monitorState.service.status = status === "error" ? "error" : "idle";
 }
 
-function hasValidSystemMetrics(metrics: SystemMetrics | null): metrics is SystemMetrics {
-  if (!metrics) return false;
-  return (
-    Number.isFinite(metrics.buy_avg) &&
-    metrics.buy_avg > 0 &&
-    Number.isFinite(metrics.sell_avg) &&
-    metrics.sell_avg > 0
-  );
+function toPositiveNumber(value: unknown): number | null {
+  const num = Number(value);
+  return Number.isFinite(num) && num > 0 ? num : null;
 }
 
 function getBranchRun(branch: BranchSummary): BranchRunState {
@@ -309,6 +320,68 @@ function requireBrainActionApiKey(req: Request, res: Response, next: NextFunctio
   }
 
   next();
+}
+
+// Refresca la configuración de pricing desde el backend (lo que el admin edita en la UI).
+// Si el backend falla, se conserva la última configuración buena conocida.
+async function refreshPricingConfig(): Promise<void> {
+  try {
+    const response = await fetch(`${BACKEND_URL}/brain/config`, {
+      headers: { "x-brain-api-key": BRAIN_API_KEY },
+    });
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+    const data = await response.json();
+    const cfg = (data?.config ?? {}) as Record<string, unknown>;
+
+    const next: ExchangeConfig = {
+      ...activeConfig,
+      minSpreadCents: toPositiveNumber(cfg.minSpreadCents) ?? baseConfig.minSpreadCents,
+      startingSpreadCents: toPositiveNumber(cfg.startingSpreadCents) ?? baseConfig.startingSpreadCents,
+      maxSpreadCents: toPositiveNumber(cfg.maxSpreadCents) ?? baseConfig.maxSpreadCents,
+      operationsThreshold: toPositiveNumber(cfg.operationsThreshold) ?? baseConfig.operationsThreshold,
+      centsStepUp: toPositiveNumber(cfg.centsStepUp) ?? baseConfig.centsStepUp,
+      targetUsdInventory: toPositiveNumber(cfg.targetUsdInventory) ?? baseConfig.targetUsdInventory,
+      regionalAnchorWeight: Number.isFinite(Number(cfg.regionalAnchorWeight))
+        ? Math.max(0, Math.min(1, Number(cfg.regionalAnchorWeight)))
+        : baseConfig.regionalAnchorWeight,
+    };
+
+    // Sanidad: piso ≤ arranque ≤ techo (el backend valida, pero nunca confiar a ciegas)
+    if (next.minSpreadCents <= next.startingSpreadCents && next.startingSpreadCents <= next.maxSpreadCents) {
+      const changed =
+        next.minSpreadCents !== activeConfig.minSpreadCents ||
+        next.startingSpreadCents !== activeConfig.startingSpreadCents ||
+        next.maxSpreadCents !== activeConfig.maxSpreadCents ||
+        next.operationsThreshold !== activeConfig.operationsThreshold ||
+        next.centsStepUp !== activeConfig.centsStepUp ||
+        next.targetUsdInventory !== activeConfig.targetUsdInventory ||
+        next.regionalAnchorWeight !== activeConfig.regionalAnchorWeight;
+
+      activeConfig = next;
+      syncSpreadConfigToMonitor();
+
+      if (changed) {
+        pushBrainEvent("info", "fetch_metrics", "Configuración de pricing actualizada desde el backend", {
+          minSpreadCents: next.minSpreadCents,
+          startingSpreadCents: next.startingSpreadCents,
+          maxSpreadCents: next.maxSpreadCents,
+          operationsThreshold: next.operationsThreshold,
+          centsStepUp: next.centsStepUp,
+          targetUsdInventory: next.targetUsdInventory,
+          regionalAnchorWeight: next.regionalAnchorWeight,
+        });
+      }
+    } else {
+      pushBrainEvent("warn", "fetch_metrics", "Configuración del backend incoherente (piso/arranque/techo); se conserva la anterior", {
+        received: cfg,
+      });
+    }
+  } catch (error) {
+    pushBrainEvent("warn", "fetch_metrics", "No se pudo leer la configuración de pricing; se conserva la última conocida", {
+      error: sanitizeError(error),
+    });
+  }
 }
 
 async function fetchManagedBranches(): Promise<BranchSummary[]> {
@@ -723,16 +796,27 @@ async function fetchExternalRates(branch: BranchSummary): Promise<ExternalRate[]
 }
 
 function buildSystemMetrics(rawMetrics: any): SystemMetrics {
+  // Arranque de la mañana (sin operaciones del día): buy_avg/sell_avg llegan vacíos,
+  // así que usamos las tasas publicadas actuales SOLO como línea base para los deltas.
+  // El precio propuesto siempre sale del ancla FIX + competencia regional, nunca del
+  // ponderado de ayer (lo que pidió Miguel).
+  const currentBuy = toPositiveNumber(rawMetrics?.current_buy_rate);
+  const currentSell = toPositiveNumber(rawMetrics?.current_sell_rate);
+
   return {
-    buy_avg: rawMetrics?.buy_avg ?? 17.10,
-    sell_avg: rawMetrics?.sell_avg ?? 17.50,
-    fix_banxico: rawMetrics?.fix_banxico ?? null,
-    fifo_avg_cost: rawMetrics?.fifo_avg_cost ?? null,
-    usd_inventory: rawMetrics?.usd_inventory ?? 0,
-    total_buy_operations: rawMetrics?.total_buy_operations ?? 0,
-    total_sell_operations: rawMetrics?.total_sell_operations ?? 0,
-    daily_spread: rawMetrics?.daily_spread ?? 0,
-    daily_profit_mxn: rawMetrics?.daily_profit_mxn ?? 0,
+    buy_avg: toPositiveNumber(rawMetrics?.buy_avg) ?? currentBuy ?? 0,
+    sell_avg: toPositiveNumber(rawMetrics?.sell_avg) ?? currentSell ?? 0,
+    fix_banxico: toPositiveNumber(rawMetrics?.fix_banxico),
+    fifo_avg_cost: toPositiveNumber(rawMetrics?.fifo_avg_cost),
+    usd_inventory: Number(rawMetrics?.usd_inventory) || 0,
+    total_buy_operations: Number(rawMetrics?.total_buy_operations) || 0,
+    total_sell_operations: Number(rawMetrics?.total_sell_operations) || 0,
+    daily_spread: Number(rawMetrics?.daily_spread) || 0,
+    daily_profit_mxn: Number(rawMetrics?.daily_profit_mxn) || 0,
+    avg_daily_buy_operations: toPositiveNumber(rawMetrics?.avg_daily_buy_operations) ?? 0,
+    avg_daily_sell_operations: toPositiveNumber(rawMetrics?.avg_daily_sell_operations) ?? 0,
+    effective_buy_threshold: toPositiveNumber(rawMetrics?.effective_buy_threshold) ?? 0,
+    effective_sell_threshold: toPositiveNumber(rawMetrics?.effective_sell_threshold) ?? 0,
   };
 }
 
@@ -756,14 +840,86 @@ function logBranchResult(branch: BranchSummary, systemMetrics: SystemMetrics, re
   console.log(`   📈 Condición: ${result.analysis.marketCondition.toUpperCase()} | Volatilidad: ${(result.analysis.volatilityScore * 100).toFixed(1)}%`);
   console.log(`   💵 Ancla: ${src} → ${result.analysis.referenceBaseRate.toFixed(4)}${devStr}`);
   console.log(`   Compra propuesta: ${result.adjustment.adjustedBuyRate.toFixed(4)} | Venta propuesta: ${result.adjustment.adjustedSellRate.toFixed(4)}`);
+  if (result.analysis.effectiveSellThreshold) {
+    console.log(`   📐 Umbral dinámico ventas: ${result.analysis.effectiveSellThreshold} ops/escalón (prom. ${result.analysis.avgDailySellOperations.toFixed(1)}/día) → nivel ${result.analysis.sellDemandLevel}`);
+  }
+  if (result.analysis.effectiveBuyThreshold) {
+    console.log(`   📐 Umbral dinámico compras: ${result.analysis.effectiveBuyThreshold} ops/escalón (prom. ${result.analysis.avgDailyBuyOperations.toFixed(1)}/día) → nivel ${result.analysis.buyDemandLevel}`);
+  }
+  if (result.adjustment.fifoProtectionApplied) {
+    console.log(`   🔒 FIFO: venta subió +${(result.adjustment.fifoExtraSellSpread * 100).toFixed(1)}¢ sobre estrategia (${(result.adjustment.strategySellSpread * 100).toFixed(0)}¢ → ${(result.adjustment.sellSpread * 100).toFixed(0)}¢)`);
+  }
+}
+
+async function persistBrainDecision(
+  branch: BranchSummary,
+  systemMetrics: SystemMetrics,
+  result: SmartPricingResult,
+  options: { published: boolean; simulated: boolean; previousBuy?: number | null; previousSell?: number | null }
+) {
+  try {
+    const response = await fetch(`${BACKEND_URL}/brain/decisions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-brain-api-key": BRAIN_API_KEY,
+      },
+      body: JSON.stringify({
+        branchId: branch.id,
+        cycleId: monitorState.currentCycle.cycleId,
+        decisionAt: new Date().toISOString(),
+        published: options.published,
+        simulated: options.simulated,
+        buyRate: result.adjustment.adjustedBuyRate,
+        sellRate: result.adjustment.adjustedSellRate,
+        previousBuyRate: options.previousBuy ?? null,
+        previousSellRate: options.previousSell ?? null,
+        referenceBaseRate: result.analysis.referenceBaseRate,
+        referenceSource: result.analysis.referenceSource,
+        adjustmentReason: result.adjustment.adjustmentReason,
+        buySpreadCents: result.adjustment.buySpread,
+        sellSpreadCents: result.adjustment.sellSpread,
+        strategyBuySpreadCents: result.adjustment.strategyBuySpread,
+        strategySellSpreadCents: result.adjustment.strategySellSpread,
+        fifoProtectionApplied: result.adjustment.fifoProtectionApplied,
+        fifoExtraSellSpreadCents: result.adjustment.fifoExtraSellSpread,
+        fifoAvgCost: result.analysis.fifoAverageCost,
+        sellDemandLevel: result.analysis.sellDemandLevel,
+        buyDemandLevel: result.analysis.buyDemandLevel,
+        effectiveSellThreshold: result.analysis.effectiveSellThreshold,
+        effectiveBuyThreshold: result.analysis.effectiveBuyThreshold,
+        totalSellOperations: systemMetrics.total_sell_operations,
+        totalBuyOperations: systemMetrics.total_buy_operations,
+        usdInventory: systemMetrics.usd_inventory,
+        fixBanxico: systemMetrics.fix_banxico,
+        payloadJson: {
+          branchName: branch.name,
+          marketCondition: result.analysis.marketCondition,
+          alerts: result.alerts.map((a) => ({ type: a.type, severity: a.severity, message: a.message })),
+        },
+      }),
+    });
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      pushBrainEvent("warn", "publish_rates", "No se pudo guardar el historial de decisión", {
+        branchId: branch.id,
+        status: response.status,
+        error: errText.slice(0, 200),
+      });
+    }
+  } catch (error) {
+    pushBrainEvent("warn", "publish_rates", "Error guardando historial de decisión", {
+      branchId: branch.id,
+      error: sanitizeError(error),
+    });
+  }
 }
 
 async function processBranch(branch: BranchSummary) {
-  const metrics = await fetchSystemMetrics(branch);
-  const systemMetrics = buildSystemMetrics(metrics);
+  const rawMetrics = await fetchSystemMetrics(branch);
 
   setBranchRun(branch, {
-    metrics: hasValidSystemMetrics(metrics) ? systemMetrics : null,
+    metrics: null,
     externalRates: [],
     result: null,
     publishedRates: null,
@@ -771,25 +927,56 @@ async function processBranch(branch: BranchSummary) {
     error: null,
   });
 
-  if (!hasValidSystemMetrics(metrics)) {
+  if (!rawMetrics) {
     setBranchRun(branch, {
       status: "skipped",
-      error: "missing_valid_metrics",
+      error: "backend_metrics_unavailable",
     });
-    pushBrainEvent("warn", "fetch_metrics", "Métricas inválidas o backend no disponible; no se publicarán tasas para la sucursal", {
+    pushBrainEvent("warn", "fetch_metrics", "Backend no disponible; no se publicarán tasas para la sucursal", {
       branchId: branch.id,
       branchName: branch.name,
     });
     return;
   }
 
+  const systemMetrics = buildSystemMetrics(rawMetrics);
+  setBranchRun(branch, { metrics: systemMetrics });
+
+  const totalOpsToday = systemMetrics.total_buy_operations + systemMetrics.total_sell_operations;
+  if (totalOpsToday === 0) {
+    pushBrainEvent("info", "fetch_metrics", "Arranque del día: aún no hay operaciones; el precio se propone desde el ancla (FIX + competencia regional) con el spread de arranque", {
+      branchId: branch.id,
+      branchName: branch.name,
+      startingSpreadCents: activeConfig.startingSpreadCents,
+      baselineBuy: systemMetrics.buy_avg || null,
+      baselineSell: systemMetrics.sell_avg || null,
+    });
+  }
+
   engine.updateConfig({
-    ...baseConfig,
-    currentBuyRate: systemMetrics.buy_avg,
-    currentSellRate: systemMetrics.sell_avg,
+    ...activeConfig,
+    currentBuyRate: systemMetrics.buy_avg > 0 ? systemMetrics.buy_avg : activeConfig.currentBuyRate,
+    currentSellRate: systemMetrics.sell_avg > 0 ? systemMetrics.sell_avg : activeConfig.currentSellRate,
   });
 
   const externalRates = await fetchExternalRates(branch);
+
+  // Lo único indispensable para proponer precio es un ancla: FIX de Banxico o
+  // competencia regional. Sin ninguna de las dos no hay referencia y se salta limpio
+  // (antes el analyzer tronaba con un throw genérico).
+  const hasFixAnchor = systemMetrics.fix_banxico != null && systemMetrics.fix_banxico > 10;
+  if (!hasFixAnchor && externalRates.length === 0) {
+    setBranchRun(branch, {
+      status: "skipped",
+      error: "no_price_anchor",
+    });
+    pushBrainEvent("warn", "analyze", "Sin ancla de precio (ni FIX ni competencia regional disponible); no se proponen tasas para la sucursal", {
+      branchId: branch.id,
+      branchName: branch.name,
+    });
+    return;
+  }
+
   const previousSnapshot = previousSnapshots.get(branch.id);
   const snapshot: MarketSnapshot = {
     externalRates,
@@ -825,9 +1012,15 @@ async function processBranch(branch: BranchSummary) {
     referenceSource: result.analysis.referenceSource,
     buySpread: result.adjustment.buySpread,
     sellSpread: result.adjustment.sellSpread,
+    strategySellSpread: result.adjustment.strategySellSpread,
     adjustmentReason: result.adjustment.adjustmentReason,
+    sellDemandLevel: result.analysis.sellDemandLevel,
+    buyDemandLevel: result.analysis.buyDemandLevel,
+    effectiveSellThreshold: result.analysis.effectiveSellThreshold,
+    effectiveBuyThreshold: result.analysis.effectiveBuyThreshold,
     fifoAverageCost: result.analysis.fifoAverageCost,
     fifoProtectionApplied: result.adjustment.fifoProtectionApplied,
+    fifoExtraSellSpread: result.adjustment.fifoExtraSellSpread,
     minSafeSellRate: result.adjustment.minSafeSellRate,
     alerts: result.alerts.length,
   });
@@ -843,8 +1036,6 @@ async function processBranch(branch: BranchSummary) {
   }
 
   if (DRY_RUN) {
-    // Modo simulación: registramos lo que SE PUBLICARÍA para que el monitor lo muestre,
-    // pero NO tocamos el backend.
     setBranchRun(branch, {
       publishedRates: {
         buyRate: result.adjustment.adjustedBuyRate,
@@ -853,6 +1044,12 @@ async function processBranch(branch: BranchSummary) {
         appliedAt: new Date().toISOString(),
         simulated: true,
       },
+    });
+    await persistBrainDecision(branch, systemMetrics, result, {
+      published: false,
+      simulated: true,
+      previousBuy: systemMetrics.buy_avg > 0 ? systemMetrics.buy_avg : null,
+      previousSell: systemMetrics.sell_avg > 0 ? systemMetrics.sell_avg : null,
     });
     pushBrainEvent("info", "publish_rates", "Modo simulación (develop): tasas calculadas pero NO publicadas", {
       branchId: branch.id,
@@ -863,12 +1060,22 @@ async function processBranch(branch: BranchSummary) {
     return;
   }
 
+  const previousBuy = systemMetrics.buy_avg > 0 ? systemMetrics.buy_avg : null;
+  const previousSell = systemMetrics.sell_avg > 0 ? systemMetrics.sell_avg : null;
+
   await updateSystemRates(
     branch,
     result.adjustment.adjustedBuyRate,
     result.adjustment.adjustedSellRate,
     result.adjustment.adjustmentReason
   );
+
+  await persistBrainDecision(branch, systemMetrics, result, {
+    published: true,
+    simulated: false,
+    previousBuy,
+    previousSell,
+  });
 }
 
 async function runPricingCycle() {
@@ -881,6 +1088,7 @@ async function runPricingCycle() {
   });
 
   try {
+    await refreshPricingConfig();
     const branches = await fetchManagedBranches();
     if (branches.length === 0) {
       completeCycle("error", "no_managed_branches");
