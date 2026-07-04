@@ -27,15 +27,18 @@ export class MarketAnalyzer {
       : null;
 
     // ── ANCLA DEL PRECIO DE REFERENCIA (referencia cruzada — Opción B) ──────
-    // En lugar de usar solo el FIX, mezclamos FIX + competencia regional de Sonora:
-    //   referenceBaseRate = (1 - w) * FIX + w * regionalMidpoint
-    // donde w = regionalAnchorWeight. Esto es lo que pidió Miguel: que el precio
-    // reaccione al mercado de su zona, no solo al interbancario nacional.
+    // En lugar de usar solo el FIX, mezclamos el Promedio Ponderado de Operaciones + competencia regional de Sonora:
+    //   referenceBaseRate = (1 - w) * weightedMidpoint + w * regionalMidpoint
+    // donde w = regionalAnchorWeight.
     //
     // Cadena de respaldo (nunca truena):
-    //   1. FIX + regional → mezcla ponderada               (referenceSource "blended")
-    //   2. Solo FIX                                          (referenceSource "fix_banxico")
-    //   3. Solo regional / externo                           (referenceSource "external_avg")
+    //   1. Ponderado + regional → mezcla ponderada         (referenceSource "blended_weighted")
+    //   2. Solo Ponderado                                   (referenceSource "weighted_avg")
+    //   3. FIX + regional → mezcla ponderada (respaldo)     (referenceSource "blended")
+    //   4. Solo FIX (respaldo)                              (referenceSource "fix_banxico")
+    //   5. Solo regional / externo                           (referenceSource "external_avg")
+    const weightedMidpoint = (metrics.buy_avg + metrics.sell_avg) / 2;
+    const hasWeighted = typeof weightedMidpoint === "number" && weightedMidpoint > 10;
     const hasFix = !!(metrics.fix_banxico && metrics.fix_banxico > 10);
     const w = this.clamp01(this.config.regionalAnchorWeight ?? 0);
 
@@ -43,7 +46,14 @@ export class MarketAnalyzer {
     let referenceSource: MarketAnalysis['referenceSource'];
     let appliedRegionalWeight = 0;
 
-    if (hasFix && regionalMidpoint != null && w > 0) {
+    if (hasWeighted && regionalMidpoint != null && w > 0) {
+      referenceBaseRate = (1 - w) * weightedMidpoint + w * regionalMidpoint;
+      referenceSource = 'blended_weighted';
+      appliedRegionalWeight = w;
+    } else if (hasWeighted) {
+      referenceBaseRate = weightedMidpoint;
+      referenceSource = 'weighted_avg';
+    } else if (hasFix && regionalMidpoint != null && w > 0) {
       referenceBaseRate = (1 - w) * metrics.fix_banxico! + w * regionalMidpoint;
       referenceSource = 'blended';
       appliedRegionalWeight = w;
@@ -51,7 +61,6 @@ export class MarketAnalyzer {
       referenceBaseRate = metrics.fix_banxico!;
       referenceSource = 'fix_banxico';
     } else {
-      // Sin FIX → usamos el mercado disponible (regional si existe, si no el externo)
       referenceBaseRate = regionalMidpoint ?? externalMidpoint;
       referenceSource = 'external_avg';
       appliedRegionalWeight = regionalMidpoint != null ? 1 : 0;

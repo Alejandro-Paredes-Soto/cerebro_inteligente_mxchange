@@ -824,6 +824,8 @@ function logBranchResult(branch: BranchSummary, systemMetrics: SystemMetrics, re
   const src =
     result.analysis.referenceSource === "fix_banxico" ? "🏦 FIX Banxico"
     : result.analysis.referenceSource === "blended" ? `⚖️ FIX + Regional (w=${result.analysis.regionalAnchorWeight.toFixed(2)})`
+    : result.analysis.referenceSource === "weighted_avg" ? "📈 Ponderado de Operaciones"
+    : result.analysis.referenceSource === "blended_weighted" ? `⚖️ Ponderado + Regional (w=${result.analysis.regionalAnchorWeight.toFixed(2)})`
     : "📊 Promedio Externo";
   const dev = result.analysis.fixDeviation;
   const devStr = dev !== 0 ? ` (mercado regional ${dev > 0 ? "+" : ""}${(dev * 100).toFixed(1)}¢ vs FIX)` : "";

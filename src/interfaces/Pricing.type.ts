@@ -36,7 +36,7 @@ export interface MarketAnalysis {
   averageExternalBuy: number;
   averageExternalSell: number;
   referenceBaseRate: number;   // Ancla de precio: mezcla FIX + competencia regional, o el fallback disponible
-  referenceSource: 'blended' | 'fix_banxico' | 'external_avg'; // De dónde viene la referencia
+  referenceSource: 'blended' | 'fix_banxico' | 'external_avg' | 'weighted_avg' | 'blended_weighted'; // De dónde viene la referencia
   regionalMidpoint: number | null; // Punto medio promedio de la competencia regional (Sonora). null si no hay.
   regionalAnchorWeight: number;    // Peso (0..1) que tuvo la competencia regional en el ancla mezclada
   fixDeviation: number;        // Cuánto se aleja el mercado regional del FIX (+ = regional más caro)
