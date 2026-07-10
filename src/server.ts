@@ -23,8 +23,9 @@ function resolveEnvFile(): string {
   return ".env";
 }
 
-// override: true → lo del .env manda sobre PM2/shell (evita que APP_ENV=production en ecosystem ignore tu .env local).
-dotenv.config({ path: resolveEnvFile(), override: true });
+// Sin override: las variables del sistema/VPS tienen SIEMPRE precedencia sobre el .env.
+// El .env solo actúa como fallback para variables no definidas en el entorno.
+dotenv.config({ path: resolveEnvFile(), override: false });
 
 const app = express();
 
@@ -48,6 +49,9 @@ const DRY_RUN =
   BRAIN_DRY_RUN_RAW != null && BRAIN_DRY_RUN_RAW !== ""
     ? /^(1|true|yes|on)$/i.test(BRAIN_DRY_RUN_RAW)
     : APP_ENV !== "production";
+
+// Log de arranque: confirma qué valores se leyeron realmente
+console.log(`[CEREBRO BOOT] APP_ENV=${APP_ENV} | BRAIN_DRY_RUN raw="${BRAIN_DRY_RUN_RAW ?? '(no definida)'}" | DRY_RUN=${DRY_RUN} | modo=${DRY_RUN ? 'SIMULACIÓN' : 'PRODUCCIÓN'} | .env=${resolveEnvFile()}`);
 
 const CYCLE_INTERVAL_MS = 5 * 60 * 1000;
 
